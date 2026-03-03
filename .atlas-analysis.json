@@ -1,0 +1,123 @@
+{
+  "projectType": "general",
+  "projectName": "MC-CPP",
+  "projectDescription": "A high-performance C++ voxel game engine with advanced rendering features including cascaded shadow mapping and colored lighting.",
+  "theme": "aspen",
+  "primaryColor": "#2E7D32",
+  "lightColor": "#66BB6A",
+  "darkColor": "#1B5E20",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Getting Started",
+            "pages": [
+              "introduction",
+              "building",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Architecture",
+            "pages": [
+              "architecture/overview",
+              "architecture/game-loop",
+              "architecture/world-system"
+            ]
+          },
+          {
+            "group": "Rendering",
+            "pages": [
+              "rendering/overview",
+              "rendering/shaders",
+              "rendering/textures",
+              "rendering/lighting",
+              "rendering/shadows"
+            ]
+          },
+          {
+            "group": "World & Chunks",
+            "pages": [
+              "world/chunks",
+              "world/meshing",
+              "world/blocks"
+            ]
+          },
+          {
+            "group": "Entities & Physics",
+            "pages": [
+              "entities/player",
+              "entities/physics",
+              "entities/collision"
+            ]
+          },
+          {
+            "group": "Persistence",
+            "pages": [
+              "persistence/save-system",
+              "persistence/nbt-format"
+            ]
+          },
+          {
+            "group": "Performance",
+            "pages": [
+              "performance/optimization",
+              "performance/profiling"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Core Classes",
+            "pages": [
+              "api/world",
+              "api/chunk",
+              "api/player",
+              "api/block-type"
+            ]
+          },
+          {
+            "group": "Rendering",
+            "pages": [
+              "api/shader",
+              "api/texture-manager"
+            ]
+          },
+          {
+            "group": "Physics",
+            "pages": [
+              "api/entity",
+              "api/collider"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Cascaded Shadow Mapping (CSM) with 4 cascades",
+    "Colored lighting system with smooth lighting",
+    "Chunk-based world with streaming and meshing",
+    "Entity physics with AABB collision",
+    "NBT-based save system with gzip compression",
+    "Advanced OpenGL rendering with post-processing"
+  ],
+  "publicApiSurface": [
+    "World::set_block",
+    "World::get_block_number",
+    "World::tick",
+    "World::draw",
+    "Chunk::update_mesh",
+    "Player::update",
+    "Player::update_matrices",
+    "BlockType",
+    "TextureManager::add_texture",
+    "Save::load_chunk",
+    "Save::save_chunk"
+  ]
+}
