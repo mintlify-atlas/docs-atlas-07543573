@@ -1,0 +1,589 @@
+---
+title: World System
+description: Deep dive into world management, chunks, coordinate systems, and lighting in MC-CPP
+---
+
+The `World` class (src/world.h/cpp) is the core data structure managing all voxel data, lighting, rendering, and persistence. It coordinates chunks, block types, lighting propagation, and the rendering pipeline.
+
+## World Class Structure
+
+```cpp src/world.h
+class World {
+public:
+    Shader* shader;
+    Player* player;
+    TextureManager* texture_manager;
+    std::vector<BlockType*> block_types;
+    std::unordered_map<glm::ivec3, Chunk*, Util::IVec3Hash> chunks;
+    std::vector<Chunk*> visible_chunks;
+    
+    // Lighting queues
+    std::deque<std::pair<glm::ivec3, int>> light_increase_queue;
+    std::deque<std::pair<glm::ivec3, int>> light_decrease_queue;
+    std::deque<std::pair<glm::ivec3, int>> skylight_increase_queue;
+    std::deque<std::pair<glm::ivec3, int>> skylight_decrease_queue;
+    
+    // Day/night cycle
+    float daylight = 1800;
+    long time = 0;
+    
+    // Shadow mapping (CSM)
+    Shader* shadow_shader;
+    GLuint shadow_fbo, shadow_map;
+    std::vector<glm::mat4> shadow_matrices;
+    std::vector<float> shadow_splits;
+    
+    Save* save_system;
+};
+```
+
+## Coordinate Systems
+
+MC-CPP uses three coordinate systems:
+
+### 1. World Coordinates
+
+Global floating-point coordinates where the player and entities exist.
+
+```cpp
+glm::vec3 player_position = glm::vec3(100.5f, 64.0f, -200.3f);
+```
+
+### 2. Chunk Coordinates
+
+Integer coordinates identifying which chunk a position belongs to:
+
+```cpp src/world.cpp
+glm::ivec3 World::get_chunk_pos(glm::vec3 pos) {
+    return glm::ivec3(floor(pos.x / 16), 
+                      floor(pos.y / 128), 
+                      floor(pos.z / 16));
+}
+```
+
+**Chunk dimensions:**
+- X: 16 blocks
+- Y: 128 blocks (vertical)
+- Z: 16 blocks
+
+**Example:**
+- World position `(100, 64, -200)` → Chunk `(6, 0, -13)`
+- Chunk `(0, 0, 0)` spans world X: [0, 16), Y: [0, 128), Z: [0, 16)
+
+### 3. Local (Block) Coordinates
+
+Position within a chunk (0-15 for X/Z, 0-127 for Y):
+
+```cpp src/world.cpp
+glm::ivec3 World::get_local_pos(glm::vec3 pos) {
+    int x = (int)floor(pos.x) % 16; if (x < 0) x += 16;
+    int y = (int)floor(pos.y) % 128; if (y < 0) y += 128;
+    int z = (int)floor(pos.z) % 16; if (z < 0) z += 16;
+    return glm::ivec3(x, y, z);
+}
+```
+
+**Example:**
+- World position `(100, 64, -200)` → Local `(4, 64, 8)`
+
+<Note>
+The modulo operation handles negative coordinates correctly by adding the chunk dimension when the result is negative.
+</Note>
+
+## Chunk Management
+
+### Chunk Storage
+
+Chunks are stored in an unordered map keyed by chunk coordinates:
+
+```cpp src/world.h
+std::unordered_map<glm::ivec3, Chunk*, Util::IVec3Hash> chunks;
+```
+
+The hash function for `glm::ivec3` is defined in `src/util.h`:
+
+```cpp src/util.h
+struct IVec3Hash {
+    std::size_t operator()(const glm::ivec3& v) const {
+        return std::hash<int>()(v.x) ^ (std::hash<int>()(v.y) << 1) ^ (std::hash<int>()(v.z) << 2);
+    }
+};
+```
+
+### Chunk Structure
+
+```cpp src/chunk/chunk.h
+class Chunk {
+public:
+    World* world;
+    glm::ivec3 chunk_position; // Chunk coordinates
+    glm::vec3 position;        // World position of origin (0,0,0) block
+    bool modified;             // Dirty flag for save system
+    
+    uint8_t blocks[CHUNK_WIDTH][CHUNK_HEIGHT][CHUNK_LENGTH];   // Block IDs
+    uint8_t lightmap[CHUNK_WIDTH][CHUNK_HEIGHT][CHUNK_LENGTH]; // Packed light data
+    
+    std::map<std::tuple<int,int,int>, Subchunk*> subchunks;
+    std::vector<uint32_t> mesh;            // Opaque mesh data
+    std::vector<uint32_t> translucent_mesh; // Translucent mesh data
+    
+    GLuint vao, vbo;
+};
+```
+
+**Block Storage:**
+- `blocks[x][y][z]`: 8-bit block ID (0 = air, 1-255 = various blocks)
+- Total: 16 × 128 × 16 = 32,768 blocks per chunk
+
+**Lightmap Storage:**
+- `lightmap[x][y][z]`: Packed nibbles
+  - High 4 bits: Skylight (0-15)
+  - Low 4 bits: Block light (0-15)
+
+```cpp src/chunk/chunk.cpp
+int Chunk::get_block_light(glm::ivec3 pos) const {
+    return lightmap[pos.x][pos.y][pos.z] & 0x0F; // Mask low 4 bits
+}
+
+int Chunk::get_sky_light(glm::ivec3 pos) const {
+    return (lightmap[pos.x][pos.y][pos.z] >> 4) & 0x0F; // Shift and mask
+}
+```
+
+### Subchunks
+
+Each chunk is subdivided into 8 vertical subchunks (16×16×16 each) for efficient mesh updates:
+
+```
+Chunk (16×128×16)
+  ├─ Subchunk 0: Y [0, 16)
+  ├─ Subchunk 1: Y [16, 32)
+  ├─ Subchunk 2: Y [32, 48)
+  ├─ Subchunk 3: Y [48, 64)
+  ├─ Subchunk 4: Y [64, 80)
+  ├─ Subchunk 5: Y [80, 96)
+  ├─ Subchunk 6: Y [96, 112)
+  └─ Subchunk 7: Y [112, 128)
+```
+
+When a block changes, only the affected subchunk(s) are remeshed.
+
+## Block Operations
+
+### Getting a Block
+
+```cpp src/world.cpp
+int World::get_block_number(glm::ivec3 pos) {
+    glm::ivec3 cp = get_chunk_pos(glm::vec3(pos));
+    if (chunks.find(cp) == chunks.end()) return 0; // Air if chunk doesn't exist
+    glm::ivec3 lp = get_local_pos(glm::vec3(pos));
+    return chunks[cp]->blocks[lp.x][lp.y][lp.z];
+}
+```
+
+### Setting a Block
+
+```cpp src/world.cpp
+void World::set_block(glm::ivec3 pos, int number) {
+    if (pos.y < 0 || pos.y >= CHUNK_HEIGHT) return;
+    
+    glm::ivec3 cp = get_chunk_pos(glm::vec3(pos));
+    if (chunks.find(cp) == chunks.end()) {
+        if (number == 0) return; // Don't create chunk for air
+        chunks[cp] = new Chunk(this, cp);
+        init_skylight(chunks[cp]);
+        stitch_sky_light(chunks[cp]);
+        stitch_block_light(chunks[cp]);
+    }
+    
+    glm::ivec3 lp = get_local_pos(glm::vec3(pos));
+    Chunk* c = chunks[cp];
+    if (c->blocks[lp.x][lp.y][lp.z] == number) return; // No change
+    
+    c->blocks[lp.x][lp.y][lp.z] = number;
+    c->modified = true;
+    c->update_at_position(lp);
+    
+    // Update lighting (block light and skylight)
+    // ... (see Lighting section below)
+    
+    // Notify neighboring chunks if on border
+    if (lp.x == 0 && chunks.count(cp + Util::WEST))
+        chunks[cp + Util::WEST]->update_at_position(lp + glm::ivec3(15, 0, 0));
+    // ... (similar for all 6 faces)
+}
+```
+
+**Key steps:**
+1. Create chunk if needed (lazy allocation)
+2. Initialize skylight for new chunks
+3. Update block ID
+4. Mark chunk as modified for save system
+5. Queue mesh update for affected subchunk
+6. Update lighting queues
+7. Notify neighboring chunks if on border
+
+### Collision-Checked Placement
+
+```cpp src/world.cpp
+bool World::try_set_block(glm::ivec3 pos, int number, const Collider& player_collider) {
+    if (pos.y < 0 || pos.y >= CHUNK_HEIGHT) return false;
+    if (number == 0) { set_block(pos, 0); return true; } // Always allow breaking
+    
+    if (number < block_types.size() && block_types[number]) {
+        for (const auto& block_col : block_types[number]->colliders) {
+            Collider world_col = block_col + glm::vec3(pos);
+            if (world_col & player_collider) return false; // AABB collision
+        }
+    }
+    
+    set_block(pos, number);
+    return true;
+}
+```
+
+Prevents placing blocks inside the player's AABB.
+
+## Lighting System
+
+MC-CPP uses two independent light systems that combine for final shading:
+
+### 1. Block Light
+
+**Sources:** Torches, lava, glowstone, etc.
+
+**Properties:**
+- 15 light levels (0 = dark, 15 = brightest)
+- Decays by 1 per block in all directions
+- Blocked by opaque blocks
+
+**Light blocks defined in World:**
+```cpp src/world.h
+std::unordered_set<int> light_blocks = {10, 11, 50, 51, 62, 75};
+```
+
+### 2. Skylight
+
+**Source:** The sun (sky)
+
+**Properties:**
+- 15 light levels at the top of the world
+- No decay when traveling downward (unless blocked)
+- Decays by 1 per horizontal block
+- Affected by day/night cycle
+
+### Lighting Propagation
+
+Lighting uses a flood-fill algorithm with separate increase/decrease queues:
+
+```cpp src/world.h
+std::deque<std::pair<glm::ivec3, int>> light_increase_queue;
+std::deque<std::pair<glm::ivec3, int>> light_decrease_queue;
+std::deque<std::pair<glm::ivec3, int>> skylight_increase_queue;
+std::deque<std::pair<glm::ivec3, int>> skylight_decrease_queue;
+```
+
+#### Increase Propagation (Block Light)
+
+```cpp src/world.cpp
+void World::propagate_increase(bool update, int max_steps) {
+    int steps_left = (max_steps < 0) ? Options::LIGHT_STEPS_PER_TICK : max_steps;
+    
+    while (!light_increase_queue.empty() && steps_left-- > 0) {
+        auto [pos, level] = light_increase_queue.front();
+        light_increase_queue.pop_front();
+        
+        for (auto& d : Util::DIRECTIONS) { // 6 directions
+            glm::ivec3 n = pos + d;
+            glm::ivec3 cp = get_chunk_pos(glm::vec3(n));
+            if (chunks.find(cp) == chunks.end()) continue;
+            
+            int l = get_light(n);
+            if (!is_opaque_block(n) && l + 2 <= level) {
+                chunks[cp]->set_block_light(get_local_pos(glm::vec3(n)), level - 1);
+                light_increase_queue.push_back({n, level - 1});
+                if (update) chunks[cp]->update_at_position(get_local_pos(glm::vec3(n)));
+            }
+        }
+    }
+}
+```
+
+**Algorithm:**
+1. Pop position and light level from queue
+2. For each of 6 neighbors:
+   - Skip if chunk doesn't exist or block is opaque
+   - If neighbor's light is at least 2 lower, propagate (level - 1)
+   - Add neighbor to queue
+   - Optionally trigger mesh update
+
+#### Decrease Propagation
+
+When a light source is removed:
+
+```cpp src/world.cpp
+void World::decrease_light(glm::ivec3 pos) {
+    int old = get_light(pos);
+    chunks[get_chunk_pos(glm::vec3(pos))]->set_block_light(get_local_pos(glm::vec3(pos)), 0);
+    light_decrease_queue.push_back({pos, old});
+    propagate_decrease(true);
+    propagate_increase(true); // Re-fill from remaining sources
+}
+
+void World::propagate_decrease(bool update, int max_steps) {
+    while (!light_decrease_queue.empty() && steps_left-- > 0) {
+        auto [pos, level] = light_decrease_queue.front();
+        light_decrease_queue.pop_front();
+        
+        for (auto& d : Util::DIRECTIONS) {
+            glm::ivec3 n = pos + d;
+            int nl = get_light(n);
+            if (nl == 0) continue;
+            
+            if (nl < level) {
+                // Neighbor was lit by this source, remove it
+                chunks[...]->set_block_light(..., 0);
+                light_decrease_queue.push_back({n, nl});
+            } else if (nl >= level) {
+                // Neighbor is lit by another source, re-propagate
+                light_increase_queue.push_back({n, nl});
+            }
+        }
+    }
+}
+```
+
+**Two-phase removal:**
+1. **Decrease pass**: Clear all light that came from the removed source
+2. **Increase pass**: Re-propagate from remaining sources to fill gaps
+
+#### Skylight Initialization
+
+When a chunk is created, skylight is initialized:
+
+```cpp src/world.cpp
+void World::init_skylight(Chunk* c) {
+    glm::ivec3 global_base = c->chunk_position * glm::ivec3(CHUNK_WIDTH, CHUNK_HEIGHT, CHUNK_LENGTH);
+    
+    // Vertical pass: Find top solid block per column
+    for (int x = 0; x < CHUNK_WIDTH; x++) {
+        for (int z = 0; z < CHUNK_LENGTH; z++) {
+            int height = -1;
+            for (int y = CHUNK_HEIGHT - 1; y >= 0; y--) {
+                if (c->blocks[x][y][z] != 0 && is_opaque_block({...})) {
+                    height = y;
+                    break;
+                }
+            }
+            
+            // Fill sunlight above height
+            for (int y = CHUNK_HEIGHT - 1; y > height; y--) {
+                c->set_sky_light({x, y, z}, 15);
+                skylight_increase_queue.push_back({global_base + glm::ivec3(x, y, z), 15});
+            }
+            
+            // Fill darkness below height
+            for (int y = height; y >= 0; y--) {
+                c->set_sky_light({x, y, z}, 0);
+            }
+        }
+    }
+    
+    // Border pass: Check neighbors for light bleed-in
+    // ... (check all 4 horizontal borders)
+}
+```
+
+### Skylight Special Rules
+
+```cpp src/world.cpp
+void World::propagate_skylight_increase(bool update, int max_steps) {
+    // ...
+    for (auto& d : Util::DIRECTIONS) {
+        glm::ivec3 n = pos + d;
+        
+        int decay = 1;
+        if (d.y == -1) { // Downward
+            decay = 0; // No decay when going down
+            int block_id = get_block_number(n);
+            if (block_id != 0 && !block_types[block_id]->glass) 
+                decay = 1; // Except through non-glass blocks
+        }
+        
+        int new_l = level - decay;
+        // ...
+    }
+}
+```
+
+**Downward propagation:**
+- Light level 15 at sky → 15 all the way down (if no obstructions)
+- Allows sunlight to reach deep caves through open shafts
+
+## Day/Night Cycle
+
+```cpp src/world.cpp
+void World::tick(float dt) {
+    time++; // Increments every tick
+    
+    // 36000 ticks = 1 full day/night cycle
+    double phase = std::fmod(static_cast<double>(time) + 9000.0, 36000.0) / 36000.0;
+    float sun_height = static_cast<float>(0.5 * (std::sin(phase * glm::two_pi<double>()) + 1.0));
+    daylight = glm::mix(480.0f, 1800.0f, sun_height);
+}
+
+float World::get_daylight_factor() const {
+    return std::clamp(daylight / 1800.0f, 0.0f, 1.0f);
+}
+```
+
+**Daylight values:**
+- **480**: Dawn/dusk (dim)
+- **1800**: Noon (bright)
+- Sinusoidal interpolation creates smooth transitions
+
+**Sun direction for shadows:**
+```cpp src/world.cpp
+glm::vec3 World::get_light_direction() const {
+    double phase = std::fmod(static_cast<double>(time) + 9000.0, 36000.0) / 36000.0;
+    double azimuth = phase * glm::two_pi<double>();
+    float elevation = glm::mix(0.2f, 0.85f, static_cast<float>(0.5 * (std::sin(azimuth) + 1.0)));
+    return glm::normalize(glm::vec3(static_cast<float>(std::cos(azimuth)), -elevation, static_cast<float>(std::sin(azimuth))));
+}
+```
+
+## Rendering Pipeline
+
+### 1. Prepare Rendering (Visibility Culling)
+
+```cpp src/world.cpp
+void World::prepare_rendering() {
+    visible_chunks.clear();
+    std::vector<std::pair<float, Chunk*>> candidates;
+    
+    for (auto& kv : chunks) {
+        glm::vec3 center = kv.second->position + 
+                           glm::vec3(CHUNK_WIDTH * 0.5f, CHUNK_HEIGHT * 0.5f, CHUNK_LENGTH * 0.5f);
+        float dist2 = glm::length2(player->position - center);
+        candidates.push_back({dist2, kv.second});
+    }
+    
+    // Sort farthest to nearest
+    std::sort(candidates.begin(), candidates.end(), 
+              [](const auto& a, const auto& b) { return a.first > b.first; });
+    
+    for (auto& c : candidates) visible_chunks.push_back(c.second);
+}
+```
+
+<Note>
+Chunks are sorted **farthest to nearest** to ensure proper back-to-front rendering of translucent blocks (water, glass, etc.).
+</Note>
+
+### 2. Shadow Pass
+
+See the [Shadow Mapping documentation](/rendering/shadows) for detailed CSM implementation.
+
+### 3. Main Draw
+
+```cpp src/world.cpp
+void World::draw() {
+    shader->use();
+    shader->setFloat(shader_daylight_loc, get_daylight_factor());
+    shader->setInt(shader->find_uniform("u_TextureArraySampler"), 0);
+    
+    // Upload shadow uniforms if enabled
+    if (shadows_enabled && shadow_map) {
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D_ARRAY, shadow_map);
+        shader->setInt(shader_shadow_map_loc, 1);
+        shader->setMat4Array(shader_light_space_mats_loc, shadow_matrices);
+        // ...
+    }
+    
+    // Draw opaque
+    for (auto* c : visible_chunks) c->draw(GL_TRIANGLES);
+    
+    // Draw translucent (depth writes disabled)
+    draw_translucent();
+}
+
+void World::draw_translucent() {
+    glDepthMask(GL_FALSE);
+    for (auto* c : visible_chunks) c->draw_translucent(GL_TRIANGLES);
+    glDepthMask(GL_TRUE);
+}
+```
+
+## Persistence (Save System)
+
+The `Save` class (src/save.cpp) handles:
+
+- **Loading**: Read NBT files from `save/` directory
+- **Saving**: Write modified chunks to disk
+- **Streaming**: Load chunks near player, unload distant ones
+- **Terrain Generation**: Fallback flat world if no save exists
+
+```cpp src/main.cpp
+world.save_system = new Save(&world);
+world.save_system->load();
+
+// In game loop
+world.save_system->update_streaming(player.position);
+world.save_system->stream_next(1); // Load 1 chunk per frame
+
+// On exit or key press
+world.save_system->save();
+```
+
+## Performance Optimizations
+
+### Incremental Lighting
+
+```cpp src/world.cpp
+void World::propagate_increase(bool update, int max_steps) {
+    int steps_left = (max_steps < 0) ? Options::LIGHT_STEPS_PER_TICK : max_steps;
+    // ...
+}
+```
+
+Limits light propagation to a fixed number of steps per tick to avoid frame spikes. Configured in `Options::LIGHT_STEPS_PER_TICK`.
+
+### Lazy Chunk Creation
+
+Chunks are only allocated when non-air blocks are placed:
+
+```cpp
+if (chunks.find(cp) == chunks.end()) {
+    if (number == 0) return; // Don't create chunk for air
+    chunks[cp] = new Chunk(this, cp);
+}
+```
+
+### Subchunk Meshing
+
+Only affected 16×16×16 subchunks are remeshed when blocks change, not the entire 16×128×16 chunk.
+
+### Shared Index Buffer
+
+All chunks use a shared index buffer (IBO) for quad-to-triangle conversion:
+
+```cpp src/world.cpp
+std::vector<unsigned int> indices;
+for (int i = 0; i < CHUNK_WIDTH * CHUNK_HEIGHT * CHUNK_LENGTH * 8; i++) {
+    indices.insert(indices.end(), {4u*i, 4u*i+1, 4u*i+2, 4u*i+2, 4u*i+3, 4u*i});
+}
+glGenBuffers(1, &ibo);
+glBufferData(GL_ELEMENT_ARRAY_BUFFER, indices.size() * sizeof(unsigned int), indices.data(), GL_STATIC_DRAW);
+```
+
+## Related Topics
+
+<CardGroup cols={2}>
+  <Card title="Game Loop" icon="refresh" href="/architecture/game-loop">
+    Detailed frame execution and update cycle
+  </Card>
+  <Card title="Architecture Overview" icon="sitemap" href="/architecture/overview">
+    High-level architecture overview
+  </Card>
+</CardGroup>

@@ -1,0 +1,224 @@
+---
+title: Performance Optimizations
+description: Performance optimizations in MC-CPP including chunk loading improvements and FPS stabilization
+---
+
+## Overview
+
+MC-CPP implements several performance optimizations to maintain stable frame rates during gameplay, particularly during chunk streaming and world exploration.
+
+## Chunk Loading FPS Stabilization
+
+### Problem Identification
+
+The primary source of FPS drops during streaming chunk loading was identified in `Save::load_chunk` (src/save.cpp:89):
+
+- **Full lighting propagation**: The function executed complete lighting queue processing via `world->propagate_skylight_increase(false, std::numeric_limits<int>::max())` and `world->propagate_increase(false, std::numeric_limits<int>::max())` without step limits in a single frame
+- **Immediate mesh rebuilding**: All subchunk meshes and the final chunk mesh were rebuilt immediately via `Subchunk::update_mesh()` for all subchunks plus `Chunk::update_mesh()`, bypassing the existing per-frame update system
+- **Result**: Even when streaming "one chunk per frame" (`Save::stream_next(1)` in main.cpp), individual frames could hit heavy `load_chunk` operations causing render time spikes
+
+### Solution: Eager Build Flag
+
+`Save::load_chunk` now accepts a `bool eager_build` parameter (src/save.h:24, src/save.cpp:89):
+
+**Initial world loading** (`Save::load`, src/save.cpp:221):
+- Calls `load_chunk(chunk_pos, true)` with `eager_build = true`
+- Preserves original lighting behavior: executes full lighting queue propagation
+- Ensures the initial radius around the player is correctly lit immediately
+
+**Streaming during gameplay** (`Save::stream_next`, src/save.cpp:330):
+- Calls `load_chunk(pos, false)` with `eager_build = false`
+- Distributes heavy operations across multiple frames
+
+### Deferred Processing (`eager_build = false`)
+
+When streaming chunks during gameplay:
+
+**Lighting propagation**:
+- Removed unbounded calls to `propagate_skylight_increase` and `propagate_increase`
+- Lighting queues are populated but processing happens in `World::tick()` with `Options::LIGHT_STEPS_PER_TICK` limit (default: 2048 steps per tick)
+- Uses BFS limiting to constrain per-frame CPU time
+
+**Mesh generation**:
+- Removed immediate `Subchunk::update_mesh()` loops and `Chunk::update_mesh()` calls from `load_chunk`
+- Instead calls `c->update_subchunk_meshes()` which populates the chunk's internal `chunk_update_queue`
+- Neighboring chunks also call `update_subchunk_meshes()` via `update_neighbor` for correct boundary updates
+- Heavy mesh building is deferred to later frames
+
+### Frame-Distributed Processing
+
+Heavy operations are now distributed across frames in `World::tick()`:
+
+**Lighting** (src/world.cpp):
+- `propagate_increase(true)` and `propagate_skylight_increase(true)` use `Options::LIGHT_STEPS_PER_TICK` (default: 2048)
+- Limits BFS work per frame for block light and skylight
+
+**Mesh building**:
+- `Chunk::process_chunk_updates()` processes max `Options::CHUNK_UPDATES` subchunks per tick (default: 4)
+- `World::chunk_building_queue` calls `Chunk::update_mesh()` for at most one chunk per frame
+
+### Effect
+
+When entering new world areas with chunk streaming:
+- Heavy work (lighting + mesh generation) no longer executes entirely in one `load_chunk` call
+- Work is spread across several subsequent frames
+- FPS drops from CPU spikes are significantly reduced
+- Trade-off: new chunks may "build up" visually over a few frames instead of appearing instantly
+- Frame time becomes much more consistent
+
+## Performance Tunables
+
+All performance options are defined in `src/options.h`:
+
+### Chunk Processing
+
+```cpp
+Options::CHUNK_UPDATES = 4;  // Max subchunks to rebuild per tick
+Options::LIGHT_STEPS_PER_TICK = 2048;  // BFS steps per tick for lighting
+```
+
+**CHUNK_UPDATES** (src/options.h:9):
+- Controls how many subchunk meshes are rebuilt per frame
+- Lower values = smoother FPS but slower chunk appearance
+- Higher values = faster chunk building but potential frame spikes
+
+**LIGHT_STEPS_PER_TICK** (src/options.h:18):
+- Limits lighting propagation work per frame
+- Affects both block light and skylight BFS traversal
+- 2048 steps provides good balance for most scenarios
+
+### Render Distance
+
+```cpp
+Options::RENDER_DISTANCE = 8;  // Chunks from player
+```
+
+**RENDER_DISTANCE** (src/options.h:5):
+- Determines chunk loading radius around the player
+- Used by `Save::load()` and `Save::update_streaming()`
+- Directly impacts memory usage and visible chunk count
+- Chunks beyond `(radius + 3)` are automatically unloaded
+
+### Frame Limiting
+
+```cpp
+Options::VSYNC = false;
+Options::MAX_CPU_AHEAD_FRAMES = 3;
+Options::SMOOTH_FPS = false;
+```
+
+**VSYNC** (src/options.h:10):
+- Synchronizes rendering with display refresh rate
+- Reduces screen tearing but may cap framerate
+
+**MAX_CPU_AHEAD_FRAMES** (src/options.h:11):
+- Controls CPU-GPU pipeline depth
+- Lower values reduce input lag
+- Higher values may improve throughput
+
+**SMOOTH_FPS** (src/options.h:12):
+- Additional frame time smoothing
+- Helps reduce micro-stuttering
+
+### Visual Quality vs Performance
+
+```cpp
+Options::SMOOTH_LIGHTING = true;
+Options::FANCY_TRANSLUCENCY = true;
+Options::COLORED_LIGHTING = true;
+Options::MIPMAP_TYPE = GL_NEAREST_MIPMAP_LINEAR;
+Options::ANTIALIASING = 0;
+```
+
+**SMOOTH_LIGHTING** (src/options.h:13):
+- Enables per-vertex ambient occlusion and smooth lighting
+- Significant visual improvement with moderate performance cost
+
+**FANCY_TRANSLUCENCY** (src/options.h:14):
+- Proper depth sorting for translucent blocks
+- Disable for performance gain on older hardware
+
+**COLORED_LIGHTING** (src/options.h:16):
+- RGB lighting instead of monochrome
+- Minimal performance impact on modern GPUs
+
+**MIPMAP_TYPE** (src/options.h:15):
+- Texture filtering mode
+- Options: `GL_NEAREST`, `GL_LINEAR`, `GL_NEAREST_MIPMAP_LINEAR`, `GL_LINEAR_MIPMAP_LINEAR`
+- Affects texture quality at distance
+
+**ANTIALIASING** (src/options.h:17):
+- MSAA sample count (0, 2, 4, 8)
+- Higher values = smoother edges but lower performance
+
+## Streaming Architecture
+
+### Initial Load (`Save::load`, src/save.cpp:221)
+
+1. Calculates center chunk from player position
+2. Generates offsets for all chunks within `RENDER_DISTANCE`
+3. Sorts by Manhattan distance for optimal loading order
+4. Loads chunks within `initial_radius` (default: 2) immediately with `eager_build = true`
+5. Queues remaining chunks in `pending_chunks` for streaming
+
+### Runtime Streaming (`Save::update_streaming`, src/save.cpp:266)
+
+Called each frame to maintain chunk ring around player:
+
+**Queue generation**:
+- Checks when player moves to a new chunk
+- Queues chunks within radius that don't exist yet
+- Avoids duplicates in `pending_chunks`
+
+**Chunk unloading**:
+- Unloads chunks beyond `(RENDER_DISTANCE + 3)` squared distance
+- Saves modified chunks before unloading
+- Unlinks neighbor pointers to prevent dangling references
+- Removes from `visible_chunks` and `chunk_building_queue`
+
+### Stream Processing (`Save::stream_next`, src/save.cpp:330)
+
+Called from game loop to load pending chunks:
+
+```cpp
+Save::stream_next(1);  // Load 1 chunk per frame
+```
+
+- Pops chunks from `pending_chunks` queue
+- Calls `load_chunk(pos, false)` for deferred processing
+- Continues until queue empty or max chunks reached
+
+## Recommended Settings
+
+### High-End Systems
+
+```cpp
+RENDER_DISTANCE = 12;
+CHUNK_UPDATES = 8;
+LIGHT_STEPS_PER_TICK = 4096;
+SMOOTH_LIGHTING = true;
+FANCY_TRANSLUCENCY = true;
+ANTIALIASING = 4;
+```
+
+### Mid-Range Systems
+
+```cpp
+RENDER_DISTANCE = 8;
+CHUNK_UPDATES = 4;
+LIGHT_STEPS_PER_TICK = 2048;
+SMOOTH_LIGHTING = true;
+FANCY_TRANSLUCENCY = true;
+ANTIALIASING = 2;
+```
+
+### Low-End Systems
+
+```cpp
+RENDER_DISTANCE = 6;
+CHUNK_UPDATES = 2;
+LIGHT_STEPS_PER_TICK = 1024;
+SMOOTH_LIGHTING = false;
+FANCY_TRANSLUCENCY = false;
+ANTIALIASING = 0;
+```

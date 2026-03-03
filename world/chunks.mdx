@@ -1,0 +1,219 @@
+---
+title: Chunk System Architecture
+description: Learn about MC-CPP's chunk-based world storage using 16x128x16 chunks with subchunk subdivision and neighbor caching
+---
+
+MC-CPP divides the world into **chunks** - vertical columns of blocks that form the fundamental unit of world storage, meshing, and rendering.
+
+## Chunk Dimensions
+
+Chunks are defined with fixed dimensions in `src/chunk/chunk.h:15-17`:
+
+```cpp
+const int CHUNK_WIDTH = 16;
+const int CHUNK_HEIGHT = 128;
+const int CHUNK_LENGTH = 16;
+```
+
+Each chunk contains **32,768 blocks** (16 × 128 × 16) stored as a 3D array.
+
+## Chunk Class Structure
+
+The `Chunk` class (`src/chunk/chunk.h:19-62`) manages all data and operations for a single chunk:
+
+```cpp
+class Chunk {
+public:
+    World* world;
+    glm::ivec3 chunk_position;      // Position in chunk coordinates
+    glm::vec3 position;              // Position in world coordinates
+    bool modified = false;
+    Chunk* neighbors[6];             // Cached neighbor chunks (E/W/U/D/S/N)
+
+    uint8_t blocks[CHUNK_WIDTH][CHUNK_HEIGHT][CHUNK_LENGTH];
+    uint8_t lightmap[CHUNK_WIDTH][CHUNK_HEIGHT][CHUNK_LENGTH];
+
+    std::map<std::tuple<int, int, int>, Subchunk*> subchunks;
+    std::deque<Subchunk*> chunk_update_queue;
+
+    std::vector<uint32_t> mesh;
+    std::vector<uint32_t> translucent_mesh;
+    int mesh_quad_count = 0;
+    int translucent_quad_count = 0;
+
+    GLuint vao = 0, vbo = 0;
+    // ... methods
+};
+```
+
+### Key Data Members
+
+| Member | Type | Purpose |
+|--------|------|----------|
+| `blocks` | `uint8_t[16][128][16]` | Block type IDs (0 = air, 1-84 = block types) |
+| `lightmap` | `uint8_t[16][128][16]` | Packed lighting data (4 bits block light + 4 bits sky light) |
+| `neighbors` | `Chunk*[6]` | Cached pointers to adjacent chunks for fast neighbor queries |
+| `subchunks` | `map<tuple, Subchunk*>` | Subdivisions for parallel meshing |
+| `mesh` / `translucent_mesh` | `vector<uint32_t>` | Combined mesh data for opaque/transparent blocks |
+
+## Lighting Storage
+
+Lighting uses 8-bit values with packed storage (`src/chunk/chunk.cpp:44-48`):
+
+```cpp
+int Chunk::get_block_light(glm::ivec3 pos) const { 
+    return lightmap[pos.x][pos.y][pos.z] & 0xF; 
+}
+
+int Chunk::get_sky_light(glm::ivec3 pos) const { 
+    return (lightmap[pos.x][pos.y][pos.z] >> 4) & 0xF; 
+}
+```
+
+- **Lower 4 bits**: Block light (0-15) from torches, lava, etc.
+- **Upper 4 bits**: Sky light (0-15) from sunlight
+
+## Neighbor Caching
+
+Chunks cache pointers to their 6 orthogonal neighbors in the order **East, West, Up, Down, South, North**. This enables fast boundary queries without world lookups.
+
+The `get_block_number_cached()` method (`src/chunk/chunk.cpp:62-78`) demonstrates the caching strategy:
+
+```cpp
+int Chunk::get_block_number_cached(glm::ivec3 global_pos) const {
+    glm::ivec3 cp = world->get_chunk_pos(glm::vec3(global_pos));
+    glm::ivec3 diff = cp - chunk_position;
+
+    // Local block - fast path
+    if (diff == glm::ivec3(0)) {
+        glm::ivec3 lp = world->get_local_pos(glm::vec3(global_pos));
+        return blocks[lp.x][lp.y][lp.z];
+    }
+
+    // Check cached neighbor
+    int idx = get_neighbor_index(diff);
+    if (idx != -1 && neighbors[idx]) {
+        glm::ivec3 lp = world->get_local_pos(glm::vec3(global_pos));
+        return neighbors[idx]->blocks[lp.x][lp.y][lp.z];
+    }
+
+    // Fallback to world query
+    return world->get_block_number(global_pos);
+}
+```
+
+## Chunk Lifecycle
+
+### Initialization
+
+When a chunk is created (`src/chunk/chunk.cpp:8-34`):
+
+1. **Allocate block/light arrays** - Zeroed via `memset`
+2. **Create subchunks** - 1×8×1 grid of 16×16×16 subchunks
+3. **Setup GPU resources** - VAO/VBO for mesh rendering
+4. **Configure vertex layout** - 3 packed `uint32_t` attributes per vertex
+
+### Update Queue System
+
+When a block changes, the affected subchunks are queued for remeshing (`src/chunk/chunk.cpp:128-160`):
+
+```cpp
+void Chunk::update_at_position(glm::ivec3 pos) {
+    int sx = pos.x / SUBCHUNK_WIDTH;
+    int sy = pos.y / SUBCHUNK_HEIGHT;
+    int sz = pos.z / SUBCHUNK_LENGTH;
+
+    add_sc(sx, sy, sz);  // Current subchunk
+
+    // Queue neighbor subchunks if on border
+    if (pos.x % SUBCHUNK_WIDTH == SUBCHUNK_WIDTH - 1) 
+        add_sc(sx + 1, sy, sz);
+    // ... similar for all 6 borders
+}
+```
+
+This ensures face culling is recalculated correctly at subchunk boundaries.
+
+### Mesh Building
+
+The chunk combines all subchunk meshes into two final buffers (`src/chunk/chunk.cpp:173-191`):
+
+```cpp
+void Chunk::update_mesh() {
+    mesh.clear(); 
+    translucent_mesh.clear();
+    
+    // Pre-allocate for efficiency
+    size_t mesh_total = 0;
+    for (auto& kv : subchunks) 
+        mesh_total += kv.second->mesh.size();
+    mesh.reserve(mesh_total);
+
+    // Concatenate all subchunk meshes
+    for(auto& kv : subchunks) {
+        mesh.insert(mesh.end(), 
+                   kv.second->mesh.begin(), 
+                   kv.second->mesh.end());
+        translucent_mesh.insert(translucent_mesh.end(),
+                               kv.second->translucent_mesh.begin(),
+                               kv.second->translucent_mesh.end());
+    }
+    
+    mesh_quad_count = mesh.size() / 12;  // 3 uint32 × 4 vertices
+    send_mesh_data_to_gpu();
+}
+```
+
+## Rendering
+
+Chunks are rendered in two passes (`src/chunk/chunk.cpp:209-239`):
+
+1. **Opaque pass** - `draw()` renders solid blocks with depth writes
+2. **Translucent pass** - `draw_translucent()` renders water/glass with depth writes disabled
+
+Both methods:
+- Bind the chunk's VAO
+- Set the `u_ChunkPosition` uniform for vertex shader offset
+- Issue indexed draw calls using the shared world IBO
+
+```cpp
+void Chunk::draw(GLenum mode, Shader* shader, int chunk_uniform) {
+    if(!mesh_quad_count) return;
+    glBindVertexArray(vao);
+    shader->setVec2i(chunk_uniform, chunk_position.x, chunk_position.z);
+    glDrawElements(mode, mesh_quad_count * 6, GL_UNSIGNED_INT, 0);
+}
+```
+
+## Performance Considerations
+
+<AccordionGroup>
+  <Accordion title="Why 16×128×16?">
+    - **16×16 horizontal** matches Minecraft's chunk size for familiarity
+    - **128 vertical** provides 64 blocks below and above sea level
+    - Power-of-2 dimensions enable fast bit-shift coordinate conversions
+  </Accordion>
+
+  <Accordion title="Neighbor Caching Benefits">
+    - **Avoids map lookups** during meshing (thousands of queries per chunk)
+    - **Enables seamless face culling** at chunk boundaries
+    - **Cache invalidation** handled by world when chunks load/unload
+  </Accordion>
+
+  <Accordion title="Separate Opaque/Translucent Meshes">
+    - **Correct transparency** requires depth-sorting translucent geometry
+    - **Better performance** by avoiding state changes mid-render
+    - **Alpha testing** in shaders handles partial transparency (leaves, fences)
+  </Accordion>
+</AccordionGroup>
+
+## Related Topics
+
+<CardGroup cols={2}>
+  <Card title="Meshing & Subchunks" icon="cube" href="/world/meshing">
+    Learn how subchunks parallelize mesh generation
+  </Card>
+  <Card title="Block Types" icon="boxes" href="/world/blocks">
+    Understand block type definitions and models
+  </Card>
+</CardGroup>

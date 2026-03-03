@@ -1,0 +1,486 @@
+---
+title: Profiling and Benchmarking
+description: Profiling tools and benchmark suites for measuring MC-CPP performance
+---
+
+## Overview
+
+MC-CPP includes dedicated profiling benchmarks to measure performance-critical operations. The test suite identifies hotspots and validates optimization strategies.
+
+## Benchmark Architecture
+
+Benchmarks use `std::chrono::high_resolution_clock` for precise timing measurements:
+
+```cpp
+using Clock = std::chrono::high_resolution_clock;
+
+auto start = Clock::now();
+// ... operation to measure
+auto end = Clock::now();
+double ms = std::chrono::duration<double, std::milli>(end - start).count();
+```
+
+## Chunk Meshing Benchmarks
+
+### Implementation (`tests/perf_bench.cpp`)
+
+Measures mesh generation performance for different chunk densities.
+
+#### Helper: Block Type Setup
+
+```cpp
+static BlockType* make_block_type(bool transparent, bool translucent = false) {
+    auto* bt = new BlockType();
+    bt->transparent = transparent;
+    bt->glass = false;
+    bt->translucent = translucent;
+    bt->is_cube = true;
+    bt->vertex_positions = std::vector<std::vector<float>>(6, std::vector<float>(12, 0.0f));
+    bt->tex_coords = std::vector<std::vector<float>>(6, std::vector<float>(8, 0.0f));
+    bt->tex_indices = std::vector<int>(6, 0);
+    bt->shading_values = std::vector<std::vector<float>>(6, std::vector<float>(4, 1.0f));
+    return bt;
+}
+```
+
+#### Test World Builder
+
+```cpp
+static std::unique_ptr<World> build_world_for_bench() {
+    auto world = std::make_unique<World>(nullptr, nullptr, nullptr);
+    world->block_types.resize(76);
+    world->block_types[1] = make_block_type(false);  // opaque block
+    world->block_types[10] = make_block_type(false); // light source
+    return world;
+}
+```
+
+#### Dense vs Sparse Filling
+
+```cpp
+static void fill_chunk(Chunk* chunk, int block_id, bool sparse) {
+    for (int x = 0; x < CHUNK_WIDTH; x++) {
+        for (int z = 0; z < CHUNK_LENGTH; z++) {
+            for (int y = 0; y < CHUNK_HEIGHT; y++) {
+                bool place = !sparse || ((x + y + z) % 31 == 0);
+                chunk->blocks[x][y][z] = place ? block_id : 0;
+            }
+        }
+    }
+}
+```
+
+**Dense**: All blocks filled (16×128×16 = 32,768 blocks)
+**Sparse**: ~3% filled using `(x + y + z) % 31 == 0` pattern
+
+#### Mesh Rebuilding Benchmark
+
+```cpp
+double bench_chunk_meshing(bool sparse, int iterations) {
+    auto world = build_world_for_bench();
+    Chunk chunk(world.get(), {0, 0, 0});
+    fill_chunk(&chunk, 1, sparse);
+
+    auto rebuild_subchunks = [&]() {
+        for (auto& kv : chunk.subchunks) {
+            kv.second->update_mesh();
+        }
+    };
+
+    rebuild_subchunks(); // warmup
+    chunk.update_mesh();
+
+    auto start = Clock::now();
+    for (int i = 0; i < iterations; i++) {
+        rebuild_subchunks();
+        chunk.update_mesh();
+    }
+    auto end = Clock::now();
+    return std::chrono::duration<double, std::milli>(end - start).count() / iterations;
+}
+```
+
+**Measures**: Time to rebuild all subchunk meshes and merge into final chunk mesh
+
+**Expected results**:
+- Dense chunks: Higher mesh generation time (more visible faces)
+- Sparse chunks: Lower time (most blocks culled by neighbors)
+
+### Usage
+
+```cpp
+int main() {
+    double dense_mesh = bench_chunk_meshing(false, 10);
+    double sparse_mesh = bench_chunk_meshing(true, 10);
+    std::cout << "[meshing] dense chunk avg:  " << dense_mesh << " ms per rebuild\n";
+    std::cout << "[meshing] sparse chunk avg: " << sparse_mesh << " ms per rebuild\n";
+    return 0;
+}
+```
+
+## Block Operations Benchmark
+
+### Set/Remove Block Performance
+
+```cpp
+double bench_set_block(int block_id, int iterations) {
+    auto world = build_world_for_bench();
+    std::vector<glm::ivec3> positions(iterations);
+    for (int i = 0; i < iterations; i++) {
+        int x = i % 16;
+        int z = (i / 16) % 16;
+        int y = 60 + (i % 8);
+        positions[i] = {x, y, z};
+    }
+
+    auto start = Clock::now();
+    for (int i = 0; i < iterations; i++) {
+        world->set_block(positions[i], block_id);
+        world->set_block(positions[i], 0); // remove to trigger reverse lighting
+    }
+    auto end = Clock::now();
+    return std::chrono::duration<double, std::milli>(end - start).count();
+}
+```
+
+**Tests**:
+- Opaque block placement/removal (block_id = 1)
+- Light source placement/removal (block_id = 10)
+
+**Measures**:
+- Block data update time
+- Lighting queue population
+- Mesh invalidation overhead
+
+### Usage
+
+```cpp
+const int set_iters = 500;
+double opaque_ms = bench_set_block(1, set_iters);
+double light_ms = bench_set_block(10, set_iters);
+
+std::cout << "[set_block] " << set_iters << " opaque place/remove: " << opaque_ms << " ms total\n";
+std::cout << "[set_block] " << set_iters << " light place/remove:  " << light_ms << " ms total\n";
+```
+
+## Hotspot Analysis (`tests/perf_hotspots.cpp`)
+
+### Chunk Sorting Optimization
+
+Compares distance calculation methods for chunk rendering order.
+
+#### Method 1: Direct Distance with sqrt
+
+```cpp
+double bench_sort_with_sqrt(int count, int iterations) {
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<float> dist(-500.0f, 500.0f);
+
+    glm::vec3 player(0.0f);
+    std::vector<glm::vec3> base(count);
+    for (auto& v : base) v = {dist(rng), dist(rng), dist(rng)};
+
+    double total_ms = 0.0;
+    for (int i = 0; i < iterations; i++) {
+        auto data = base; // copy to avoid best-case sorts
+        auto start = Clock::now();
+        std::sort(data.begin(), data.end(), [&](const glm::vec3& a, const glm::vec3& b) {
+            // Matches World::prepare_rendering comparator (glm::distance -> sqrt)
+            return glm::distance(player, a) > glm::distance(player, b);
+        });
+        auto end = Clock::now();
+        total_ms += std::chrono::duration<double, std::milli>(end - start).count();
+    }
+    return total_ms / iterations;
+}
+```
+
+**Performance issue**: `glm::distance` computes `sqrt(dx² + dy² + dz²)` for every comparison
+
+#### Method 2: Squared Distance (Optimized)
+
+```cpp
+double bench_sort_with_dist2(int count, int iterations) {
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<float> dist(-500.0f, 500.0f);
+
+    glm::vec3 player(0.0f);
+    std::vector<std::pair<float, glm::vec3>> base(count);
+    for (auto& v : base) {
+        glm::vec3 p{dist(rng), dist(rng), dist(rng)};
+        float d2 = glm::length2(p - player);
+        v = {d2, p};
+    }
+
+    double total_ms = 0.0;
+    for (int i = 0; i < iterations; i++) {
+        auto data = base;
+        auto start = Clock::now();
+        std::sort(data.begin(), data.end(), [](const auto& a, const auto& b) {
+            return a.first > b.first; // sort by squared distance
+        });
+        auto end = Clock::now();
+        total_ms += std::chrono::duration<double, std::milli>(end - start).count();
+    }
+    return total_ms / iterations;
+}
+```
+
+**Optimization**: Pre-compute squared distances, skip expensive sqrt
+
+**Ordering preserved**: Since `sqrt` is monotonic, `dist²(a) > dist²(b)` ⟺ `dist(a) > dist(b)`
+
+### Mesh Merging Optimization
+
+Compares vector concatenation strategies for merging subchunk meshes.
+
+#### Without Reserve (Naive)
+
+```cpp
+double bench_merge_no_reserve(const std::vector<DummySubchunk>& subs, int iterations) {
+    double total_ms = 0.0;
+    for (int i = 0; i < iterations; i++) {
+        std::vector<float> mesh;
+        std::vector<float> translucent;
+        auto start = Clock::now();
+        for (auto& sc : subs) {
+            mesh.insert(mesh.end(), sc.mesh.begin(), sc.mesh.end());
+            translucent.insert(translucent.end(), sc.translucent.begin(), sc.translucent.end());
+        }
+        auto end = Clock::now();
+        total_ms += std::chrono::duration<double, std::milli>(end - start).count();
+    }
+    return total_ms / iterations;
+}
+```
+
+**Performance issue**: Repeated vector reallocations as size grows
+
+#### With Reserve (Optimized)
+
+```cpp
+double bench_merge_with_reserve(const std::vector<DummySubchunk>& subs, int iterations) {
+    double total_ms = 0.0;
+    size_t mesh_total = 0;
+    size_t translucent_total = 0;
+    for (auto& sc : subs) {
+        mesh_total += sc.mesh.size();
+        translucent_total += sc.translucent.size();
+    }
+
+    for (int i = 0; i < iterations; i++) {
+        std::vector<float> mesh;
+        std::vector<float> translucent;
+        mesh.reserve(mesh_total);
+        translucent.reserve(translucent_total);
+
+        auto start = Clock::now();
+        for (auto& sc : subs) {
+            mesh.insert(mesh.end(), sc.mesh.begin(), sc.mesh.end());
+            translucent.insert(translucent.end(), sc.translucent.begin(), sc.translucent.end());
+        }
+        auto end = Clock::now();
+        total_ms += std::chrono::duration<double, std::milli>(end - start).count();
+    }
+    return total_ms / iterations;
+}
+```
+
+**Optimization**: Pre-allocate final size to avoid reallocations
+
+### Running Hotspot Tests
+
+```cpp
+int main() {
+    const int chunk_count = 2000;
+    const int iterations = 6;
+
+    double sqrt_sort = bench_sort_with_sqrt(chunk_count, iterations);
+    double dist2_sort = bench_sort_with_dist2(chunk_count, iterations);
+
+    std::cout << "Sort by glm::distance (sqrt comparator): " << sqrt_sort << " ms avg\n";
+    std::cout << "Sort by squared distance (precomputed):  " << dist2_sort << " ms avg\n";
+
+    // Simulate 32 subchunks with moderate mesh payload
+    auto subs = make_subchunks(32, 12000, 3000);
+    double merge_plain = bench_merge_no_reserve(subs, iterations);
+    double merge_reserved = bench_merge_with_reserve(subs, iterations);
+
+    std::cout << "Merge subchunk meshes without reserve:    " << merge_plain << " ms avg\n";
+    std::cout << "Merge subchunk meshes with pre-reserve:   " << merge_reserved << " ms avg\n";
+    return 0;
+}
+```
+
+## Building and Running Tests
+
+### Compilation
+
+```bash
+# From project root
+mkdir -p build
+cd build
+cmake ..
+make
+
+# Run benchmarks
+./tests/perf_bench
+./tests/perf_hotspots
+```
+
+### Expected Output
+
+**perf_bench.cpp**:
+```
+[set_block] 500 opaque place/remove: X.XX ms total
+[set_block] 500 light place/remove:  Y.YY ms total
+[meshing] dense chunk avg:  A.AA ms per rebuild
+[meshing] sparse chunk avg: B.BB ms per rebuild
+```
+
+**perf_hotspots.cpp**:
+```
+Sort by glm::distance (sqrt comparator): X.XX ms avg
+Sort by squared distance (precomputed):  Y.YY ms avg
+Merge subchunk meshes without reserve:    A.AA ms avg
+Merge subchunk meshes with pre-reserve:   B.BB ms avg
+```
+
+## Profiling Workflow
+
+### 1. Identify Hotspot
+
+Use external profilers for real-time analysis:
+
+**Linux**: `perf` or `valgrind --tool=callgrind`
+```bash
+perf record ./MC-CPP
+perf report
+```
+
+**Windows**: Visual Studio Performance Profiler or Intel VTune
+
+**Cross-platform**: Tracy Profiler (requires instrumentation)
+
+### 2. Write Isolated Benchmark
+
+Extract suspected hotspot into standalone test:
+
+```cpp
+// tests/perf_my_feature.cpp
+#include <chrono>
+#include <iostream>
+
+using Clock = std::chrono::high_resolution_clock;
+
+double bench_my_operation(int iterations) {
+    auto start = Clock::now();
+    for (int i = 0; i < iterations; i++) {
+        // operation to test
+    }
+    auto end = Clock::now();
+    return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
+int main() {
+    double time_ms = bench_my_operation(1000);
+    std::cout << "Average: " << (time_ms / 1000.0) << " ms per operation\n";
+    return 0;
+}
+```
+
+### 3. Test Optimization
+
+Compare baseline vs optimized implementation:
+
+```cpp
+double baseline = bench_original(iterations);
+double optimized = bench_improved(iterations);
+double speedup = baseline / optimized;
+
+std::cout << "Baseline:  " << baseline << " ms\n";
+std::cout << "Optimized: " << optimized << " ms\n";
+std::cout << "Speedup:   " << speedup << "x\n";
+```
+
+### 4. Validate in Production
+
+Confirm improvement in actual gameplay:
+- Monitor frame times during chunk loading
+- Test with various `RENDER_DISTANCE` settings
+- Verify no visual regressions
+
+## Performance Metrics
+
+### Target Frame Budget (60 FPS)
+
+- Total frame time: 16.67 ms
+- Chunk mesh updates: < 2 ms
+- Lighting propagation: < 1 ms
+- Rendering: < 10 ms
+- Input/physics: < 2 ms
+- Overhead: < 2 ms
+
+### Bottleneck Identification
+
+Common symptoms:
+
+**CPU-bound**:
+- High frame time with low GPU utilization
+- Hotspots: mesh generation, lighting BFS, sorting
+- Solution: Reduce `CHUNK_UPDATES`, `LIGHT_STEPS_PER_TICK`
+
+**GPU-bound**:
+- GPU at 100% utilization
+- Hotspots: fragment shader complexity, overdraw
+- Solution: Reduce `RENDER_DISTANCE`, disable `SMOOTH_LIGHTING`, lower `ANTIALIASING`
+
+**Memory-bound**:
+- Stuttering during chunk load/unload
+- Hotspots: texture uploads, VBO uploads
+- Solution: Reduce `RENDER_DISTANCE`, optimize atlas packing
+
+## Adding New Benchmarks
+
+### Template
+
+```cpp
+#include <chrono>
+#include <iostream>
+
+using Clock = std::chrono::high_resolution_clock;
+
+double benchmark_operation(int iterations) {
+    // Setup
+    auto data = prepare_test_data();
+    
+    // Warmup (avoid cold cache effects)
+    perform_operation(data);
+    
+    // Measure
+    auto start = Clock::now();
+    for (int i = 0; i < iterations; i++) {
+        perform_operation(data);
+    }
+    auto end = Clock::now();
+    
+    // Return average time per iteration
+    return std::chrono::duration<double, std::milli>(end - start).count() / iterations;
+}
+
+int main() {
+    const int iterations = 100;
+    double avg_ms = benchmark_operation(iterations);
+    std::cout << "Average: " << avg_ms << " ms\n";
+    return 0;
+}
+```
+
+### Best Practices
+
+1. **Warmup runs**: Execute operation once before timing to warm caches
+2. **Multiple iterations**: Average across many runs to reduce noise
+3. **Representative data**: Use realistic data sizes and distributions
+4. **Isolated testing**: Minimize external dependencies
+5. **Consistent environment**: Close other applications, disable CPU throttling
+6. **Statistical validation**: Report min/max/stddev for stability analysis

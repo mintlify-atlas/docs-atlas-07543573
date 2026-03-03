@@ -1,0 +1,205 @@
+---
+title: Architecture Overview
+description: High-level architecture overview of the MC-CPP voxel engine, including core systems and data flow
+---
+
+MC-CPP is a Minecraft-like voxel engine written in C++ using OpenGL. The architecture follows a modular design with clear separation between rendering, world management, physics, and persistence systems.
+
+## System Architecture
+
+The engine is built around several core systems that interact to create the gameplay experience:
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                      main.cpp                           │
+│  ┌──────────┐  ┌──────────┐  ┌───────────────────┐    │
+│  │  GLFW/   │  │  Input   │  │  Game Loop        │    │
+│  │  OpenGL  │  │ Callbacks│  │  - Update         │    │
+│  │  Setup   │  │          │  │  - Render         │    │
+│  └──────────┘  └──────────┘  └───────────────────┘    │
+└─────────────────────────────────────────────────────────┘
+                           │
+        ┌──────────────────┼──────────────────┐
+        │                  │                  │
+   ┌────▼─────┐      ┌────▼─────┐      ┌────▼─────┐
+   │  World   │      │  Player  │      │ Renderer │
+   │          │◄─────┤          │      │          │
+   │ - Chunks │      │ - Physics│      │ - Shaders│
+   │ - Blocks │      │ - Input  │      │ - Texture│
+   │ - Light  │      │ - Camera │      │ - UI     │
+   └────┬─────┘      └──────────┘      └──────────┘
+        │
+   ┌────▼─────┐      ┌──────────┐      ┌──────────┐
+   │  Chunk   │      │   Save   │      │  Audio   │
+   │          │      │  System  │      │          │
+   │ - Mesh   │      │ - NBT I/O│      │ - Music  │
+   │ - Blocks │      │ - Terrain│      │          │
+   │ - Light  │      │ - Stream │      │          │
+   └──────────┘      └──────────┘      └──────────┘
+```
+
+## Core Components
+
+### World System
+
+The `World` class (src/world.h/cpp) is the central coordinator that manages:
+
+- **Chunk Management**: Hash map of chunks keyed by chunk coordinates (`glm::ivec3`)
+- **Block Type Registry**: Array of `BlockType*` loaded from `data/blocks.mccpp`
+- **Lighting System**: Dual propagation queues for block light and skylight
+- **Rendering Pipeline**: Visibility culling, shadow mapping, and draw calls
+
+```cpp src/world.h
+class World {
+public:
+    Shader* shader;
+    Player* player;
+    TextureManager* texture_manager;
+    std::vector<BlockType*> block_types;
+    std::unordered_map<glm::ivec3, Chunk*, Util::IVec3Hash> chunks;
+    std::vector<Chunk*> visible_chunks;
+    
+    // Lighting queues
+    std::deque<std::pair<glm::ivec3, int>> light_increase_queue;
+    std::deque<std::pair<glm::ivec3, int>> light_decrease_queue;
+    std::deque<std::pair<glm::ivec3, int>> skylight_increase_queue;
+    std::deque<std::pair<glm::ivec3, int>> skylight_decrease_queue;
+};
+```
+
+### Chunk System
+
+Chunks are 16×128×16 voxel volumes (src/chunk/chunk.h/cpp):
+
+- **Block Storage**: 3D array `uint8_t blocks[16][128][16]`
+- **Lighting Data**: Packed nibbles in `uint8_t lightmap[16][128][16]` (4 bits skylight + 4 bits block light)
+- **Mesh Generation**: Subdivided into 16-block-tall subchunks for efficient updates
+- **GPU Upload**: VAO/VBO with packed vertex data (position, UV, light)
+
+```cpp src/chunk/chunk.h
+const int CHUNK_WIDTH = 16;
+const int CHUNK_HEIGHT = 128;
+const int CHUNK_LENGTH = 16;
+
+class Chunk {
+    uint8_t blocks[CHUNK_WIDTH][CHUNK_HEIGHT][CHUNK_LENGTH];
+    uint8_t lightmap[CHUNK_WIDTH][CHUNK_HEIGHT][CHUNK_LENGTH];
+    std::map<std::tuple<int,int,int>, Subchunk*> subchunks;
+};
+```
+
+### Player & Entity System
+
+The `Player` class (src/entity/player.h/cpp) extends the base `Entity` class:
+
+- **Physics Integration**: Gravity, drag, AABB collision with block colliders
+- **Input Handling**: Movement acceleration, sprint mechanics, flying mode
+- **Camera System**: View/projection matrices with FOV adjustment for sprinting
+- **Interpolation**: Smooth rendering between physics ticks
+
+```cpp src/entity/player.h
+class Player : public Entity {
+public:
+    glm::mat4 p_matrix, mv_matrix, vp_matrix;
+    float view_width, view_height;
+    float near_plane, far_plane;
+    float speed, target_speed;
+    bool is_sprinting;
+    glm::vec3 interpolated_position;
+};
+```
+
+### Rendering Pipeline
+
+The rendering system uses modern OpenGL with several advanced features:
+
+- **Texture Array Atlas**: All block textures in a single `GL_TEXTURE_2D_ARRAY` (TextureManager)
+- **Cascaded Shadow Maps (CSM)**: 4-cascade directional shadows from the sun
+- **Colored Lighting**: Separate day/night and block light with smooth propagation
+- **Post-Processing**: Underwater effects, fullscreen shader pass
+- **Chunk Sorting**: Distance-based ordering for translucent rendering
+
+### Block Type System
+
+Blocks are defined via:
+
+- **Model Templates**: Cube, plant, liquid, slab, torch, door, ladder, etc. (src/models/)
+- **Texture Bindings**: Face-specific texture assignments
+- **Properties**: Transparency, colliders, light emission
+- **Data File**: `data/blocks.mccpp` maps IDs to models/textures/names
+
+## Data Flow
+
+### Block Placement/Breaking
+
+1. **Raycast**: `HitRay` traces from player eye position
+2. **Collision Check**: `World::try_set_block` validates against player AABB
+3. **Block Update**: `World::set_block` modifies chunk data
+4. **Light Update**: Triggers light propagation queues
+5. **Mesh Update**: `Chunk::update_at_position` queues affected subchunks
+6. **Neighbor Notification**: Border blocks update adjacent chunks
+
+### Lighting Propagation
+
+Lighting uses flood-fill propagation with separate queues:
+
+- **Block Light**: 15 levels, decays by 1 per block
+- **Skylight**: 15 levels, no decay downward, 1 per horizontal
+- **Sources**: Torches (block light), sky (skylight)
+- **Updates**: Incremental per-tick with configurable step limits
+
+### Render Frame
+
+1. **Update Phase**: Player physics, world tick, lighting propagation
+2. **Camera Setup**: Update view/projection matrices
+3. **Visibility Culling**: Sort chunks by distance, build visible set
+4. **Shadow Pass**: Render depth for each CSM cascade
+5. **Main Pass**: Draw opaque chunks, then translucent with depth writes disabled
+6. **Post-Process**: Apply underwater/other effects
+7. **UI Overlay**: Crosshair, health bar, F3 debug screen
+
+## Persistence
+
+World data is saved to disk using NBT format:
+
+- **Save System** (src/save.cpp): Chunk streaming, load/save, terrain generation
+- **NBT Format**: Gzipped NBT with ByteArray encoding for blocks/light
+- **Streaming**: Loads chunks near player, unloads distant ones
+- **Fallback**: Generates flat terrain if no save data exists
+
+## Threading Model
+
+<Note>
+The current implementation is single-threaded. All chunk meshing, lighting propagation, and physics run on the main thread with per-frame time budgets.
+</Note>
+
+## Performance Optimizations
+
+- **Subchunk Meshing**: Only rebuild affected 16×16×16 regions when blocks change
+- **Incremental Lighting**: Configurable steps per tick to avoid frame spikes
+- **Frustum Culling**: Chunks sorted by distance, only visible ones rendered
+- **Texture Atlas**: Single bind for all block textures
+- **Index Buffer**: Shared IBO for all chunks (quad -> triangle conversion)
+
+## Dependencies
+
+Third-party libraries (in `include/`):
+
+- **GLFW**: Window/input management
+- **GLAD**: OpenGL loader
+- **GLM**: Math library (vectors, matrices)
+- **stb_image**: Texture loading
+- **stb_truetype**: Font rendering
+- **miniaudio**: Music playback
+- **zlib**: NBT compression
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Game Loop" icon="refresh" href="/architecture/game-loop">
+    Detailed breakdown of the main game loop and frame execution
+  </Card>
+  <Card title="World System" icon="globe" href="/architecture/world-system">
+    Deep dive into world management, chunks, and coordinate systems
+  </Card>
+</CardGroup>

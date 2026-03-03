@@ -1,0 +1,310 @@
+---
+title: World
+description: Core world management class handling chunks, lighting, and rendering
+---
+
+The `World` class is the central manager for the voxel world, responsible for chunk management, block placement, lighting propagation, shadow rendering, and drawing the visible world.
+
+## Constructor
+
+```cpp
+World(Shader* s, TextureManager* tm, Player* p);
+```
+
+<ParamField path="s" type="Shader*">
+  Pointer to the main world shader used for rendering
+</ParamField>
+
+<ParamField path="tm" type="TextureManager*">
+  Pointer to the texture manager for block textures
+</ParamField>
+
+<ParamField path="p" type="Player*">
+  Pointer to the player instance
+</ParamField>
+
+Initializes the world with shader uniforms, creates index buffer for chunk rendering, and optionally sets up shadow mapping resources if enabled in options.
+
+## Block Management
+
+### set_block
+
+```cpp
+void set_block(glm::ivec3 pos, int number);
+```
+
+<ParamField path="pos" type="glm::ivec3">
+  World-space position of the block to set
+</ParamField>
+
+<ParamField path="number" type="int">
+  Block type ID (0 = air)
+</ParamField>
+
+Sets a block at the specified world position. Automatically handles:
+- Chunk creation if needed
+- Light propagation (both block light and skylight)
+- Neighboring chunk updates
+- Mesh invalidation
+
+### try_set_block
+
+```cpp
+bool try_set_block(glm::ivec3 pos, int number, const Collider& player_collider);
+```
+
+<ParamField path="pos" type="glm::ivec3">
+  World-space position of the block to set
+</ParamField>
+
+<ParamField path="number" type="int">
+  Block type ID to place
+</ParamField>
+
+<ParamField path="player_collider" type="const Collider&">
+  Player's collision box to check against
+</ParamField>
+
+Attempts to set a block only if it doesn't collide with the player. Returns `true` if placement succeeded, `false` if blocked by collision.
+
+### get_block_number
+
+```cpp
+int get_block_number(glm::ivec3 pos);
+```
+
+<ParamField path="pos" type="glm::ivec3">
+  World-space position to query
+</ParamField>
+
+Returns the block type ID at the specified position. Returns 0 (air) if the chunk is not loaded.
+
+## Lighting
+
+### get_light
+
+```cpp
+int get_light(glm::ivec3 pos);
+```
+
+Returns the block light level (0-15) at the specified world position.
+
+### get_skylight
+
+```cpp
+int get_skylight(glm::ivec3 pos);
+```
+
+Returns the skylight level (0-15) at the specified position. Returns 15 above world height, 0 below.
+
+### increase_light
+
+```cpp
+void increase_light(glm::ivec3 pos, int newlight, bool update = true);
+```
+
+<ParamField path="pos" type="glm::ivec3">
+  Position to set light level
+</ParamField>
+
+<ParamField path="newlight" type="int">
+  New light level (0-15)
+</ParamField>
+
+<ParamField path="update" type="bool" default="true">
+  Whether to trigger chunk mesh updates during propagation
+</ParamField>
+
+Sets block light at a position and propagates it to neighbors.
+
+### decrease_light
+
+```cpp
+void decrease_light(glm::ivec3 pos);
+```
+
+Removes block light at a position and propagates the removal to neighbors.
+
+### init_skylight
+
+```cpp
+void init_skylight(Chunk* chunk);
+```
+
+Initializes skylight for a newly created or loaded chunk. Performs vertical sun column pass and border neighbor stitching.
+
+## Coordinate Conversion
+
+### get_chunk_pos
+
+```cpp
+glm::ivec3 get_chunk_pos(glm::vec3 pos);
+```
+
+Converts world-space position to chunk coordinates.
+
+### get_local_pos
+
+```cpp
+glm::ivec3 get_local_pos(glm::vec3 pos);
+```
+
+Converts world-space position to local chunk coordinates (0-15 x, 0-127 y, 0-15 z).
+
+## Rendering
+
+### tick
+
+```cpp
+void tick(float dt);
+```
+
+<ParamField path="dt" type="float">
+  Delta time in seconds
+</ParamField>
+
+Updates world simulation:
+- Advances day/night cycle time
+- Processes chunk mesh building queue
+- Propagates light changes
+- Updates daylight factor using sinusoidal interpolation
+
+### prepare_rendering
+
+```cpp
+void prepare_rendering();
+```
+
+Sorts visible chunks by distance from player (back-to-front) for rendering.
+
+### draw
+
+```cpp
+void draw();
+```
+
+Renders all visible chunks:
+- Sets clear color based on time of day
+- Uploads shadow uniforms if shadows are enabled
+- Draws opaque geometry
+- Draws translucent geometry with depth writes disabled
+
+### draw_translucent
+
+```cpp
+void draw_translucent();
+```
+
+Renders translucent blocks (water, glass) with blending enabled and depth writes disabled.
+
+## Shadow System
+
+### render_shadows
+
+```cpp
+void render_shadows();
+```
+
+Renders cascaded shadow maps from the sun's perspective. Updates cascade matrices and renders all visible chunks into each cascade layer.
+
+### update_shadow_cascades
+
+```cpp
+void update_shadow_cascades();
+```
+
+Computes light-space matrices for each shadow cascade based on:
+- Player's view frustum (FOV, aspect ratio, near/far planes)
+- Sun direction from `get_light_direction()`
+- Cascade split distances (log/linear mix controlled by `SHADOW_LOG_WEIGHT`)
+
+### init_shadow_resources
+
+```cpp
+bool init_shadow_resources();
+```
+
+Initializes shadow mapping resources:
+- Creates shadow shader
+- Allocates framebuffer and depth texture array
+- Caches uniform locations
+
+Returns `true` if successful, `false` on failure (automatically disables shadows).
+
+## Day/Night Cycle
+
+### speed_daytime
+
+```cpp
+void speed_daytime();
+```
+
+Advances the day/night cycle incrementally (legacy method, replaced by sinusoidal interpolation in `tick`).
+
+### get_light_direction
+
+```cpp
+glm::vec3 get_light_direction() const;
+```
+
+Returns the normalized directional light vector based on current time. Direction rotates around the world with varying elevation.
+
+### get_daylight_factor
+
+```cpp
+float get_daylight_factor() const;
+```
+
+Returns daylight intensity factor (0.0 to 1.0) for ambient lighting calculations.
+
+## Public Members
+
+```cpp
+Shader* shader;                        // Main world shader
+Player* player;                         // Player reference
+TextureManager* texture_manager;        // Block texture atlas
+std::vector<BlockType*> block_types;    // Registered block types
+std::unordered_map<glm::ivec3, Chunk*, Util::IVec3Hash> chunks; // Loaded chunks
+std::vector<Chunk*> visible_chunks;     // Sorted visible chunks
+
+float daylight;                         // Current daylight level
+long time;                              // World time in ticks
+GLuint ibo;                             // Shared index buffer
+
+bool shadows_enabled;                   // Shadow system active
+Shader* shadow_shader;                  // Shadow depth shader
+GLuint shadow_fbo;                      // Shadow framebuffer
+GLuint shadow_map;                      // Shadow depth array texture
+std::vector<glm::mat4> shadow_matrices; // Light-space matrices per cascade
+std::vector<float> shadow_splits;       // Cascade split distances
+```
+
+## Example Usage
+
+```cpp
+// Create world
+World world(&shader, &texture_manager, &player);
+
+// Place a block
+world.set_block(glm::ivec3(10, 64, 10), 1); // Stone
+
+// Query block
+int block = world.get_block_number(glm::ivec3(10, 64, 10));
+
+// Get light level
+int light = world.get_light(glm::ivec3(10, 64, 10));
+
+// Update and render
+world.tick(deltaTime);
+world.prepare_rendering();
+if (world.shadows_enabled) {
+    world.render_shadows();
+}
+world.draw();
+```
+
+## See Also
+
+- [Chunk](/api/chunk) - Individual chunk management
+- [Player](/api/player) - Player entity and camera
+- [BlockType](/api/block-type) - Block type definitions

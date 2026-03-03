@@ -1,0 +1,281 @@
+---
+title: "Shader System"
+description: "Shader compilation, uniform management, and shader programs used in MC-CPP"
+---
+
+MC-CPP uses a minimal shader wrapper (`src/renderer/shader.h/cpp`) for managing OpenGL shader programs.
+
+## Shader Class
+
+The `Shader` class provides a simple interface for shader compilation and uniform management:
+
+```cpp
+class Shader {
+public:
+    unsigned int ID;
+    Shader(const char* vertexPath, const char* fragmentPath);
+    ~Shader();
+    bool valid() const { return ID != 0; }
+    void use();
+    int find_uniform(const std::string& name);
+    void setMat4(int location, const glm::mat4& mat) const;
+    void setInt(int location, int value) const;
+    void setFloat(int location, float value) const;
+    void setVec2i(int location, int x, int y) const;
+    void setVec2(int location, const glm::vec2& value) const;
+    void setVec3(int location, const glm::vec3& value) const;
+    void setMat4Array(int location, const std::vector<glm::mat4>& mats) const;
+    void setFloatArray(int location, const std::vector<float>& values) const;
+};
+```
+
+### Loading and Compilation
+
+Shaders are loaded from disk and compiled at construction:
+
+```cpp
+Shader shader("assets/shaders/colored_lighting/vert.glsl",
+              "assets/shaders/colored_lighting/frag.glsl");
+
+if (!shader.valid()) {
+    // Compilation failed, check console for errors
+}
+```
+
+If compilation or linking fails:
+- Error messages are printed to `stdout` with shader name and error log
+- `ID` is set to 0 and `valid()` returns `false`
+- Shader object is safe to destroy
+
+See `src/renderer/shader.cpp:9-35` for error checking implementation.
+
+### Uniform Management
+
+Uniform locations are cached for performance:
+
+```cpp
+shader.use();
+int daylight_loc = shader.find_uniform("u_Daylight");
+shader.setFloat(daylight_loc, 0.85f);
+```
+
+**Important**: Uniforms are only accessible when the shader is active (`use()` must be called first).
+
+## Available Shaders
+
+### World Rendering - Colored Lighting
+
+**Location**: `assets/shaders/colored_lighting/`
+
+The main shader for rendering voxel geometry with colored lighting and shadows.
+
+#### Vertex Shader (`vert.glsl`)
+
+**Inputs**:
+```glsl
+layout(location = 0) in uint a_Data0;  // Packed position X, Y
+layout(location = 1) in uint a_Data1;  // Packed position Z, UV u, v
+layout(location = 2) in uint a_Data2;  // Texture layer, shading, lights
+```
+
+**Uniforms**:
+```glsl
+uniform ivec2 u_ChunkPosition;  // Chunk position in world
+uniform mat4 u_MVPMatrix;        // Model-View-Projection matrix
+uniform mat4 u_ViewMatrix;       // View matrix for depth calculation
+uniform float u_Daylight;        // Day/night factor [0, 1]
+```
+
+**Outputs**:
+```glsl
+out vec3 v_Position;    // World-space position
+out vec3 v_TexCoords;   // UV + texture layer
+out vec3 v_Light;       // Combined colored lighting
+out float v_ViewDepth;  // View-space depth (for CSM)
+```
+
+**Lighting calculation** (lines 44-60):
+
+```glsl
+// Decode light levels from packed data
+float blockLevel = a_Light / 15.0;
+float skyLevel = a_Skylight / 15.0;
+
+// Define color tints
+vec3 blockTint = vec3(1.10, 0.85, 0.65);  // Warm orange
+vec3 skyNight = vec3(0.25, 0.35, 0.55);   // Cool blue
+vec3 skyDay = vec3(0.85, 0.95, 1.05);     // Bright blue-white
+vec3 skyTint = mix(skyNight, skyDay, clamp(u_Daylight, 0.0, 1.0));
+
+// Apply intensity curves
+float blockIntensity = pow(blockLevel, 1.1);
+float skyIntensity = pow(skyLevel * u_Daylight, 1.2);
+
+// Combine additively
+vec3 light = blockTint * blockIntensity + skyTint * skyIntensity;
+light = max(light, vec3(0.02));  // Minimum ambient
+light = min(light, vec3(1.0));   // Clamp
+
+v_Light = light * shading;  // Apply AO/face shading
+```
+
+#### Fragment Shader (`frag.glsl`)
+
+**Uniforms**:
+```glsl
+uniform sampler2DArray u_TextureArraySampler;  // Block textures
+
+// Shadow mapping (see shadows.mdx for details)
+uniform sampler2DArray u_ShadowMap;
+uniform mat4 u_LightSpaceMatrices[MAX_CASCADES];
+uniform float u_CascadeSplits[MAX_CASCADES];
+uniform int u_ShadowCascadeCount;
+uniform vec2 u_ShadowTexelSize;
+uniform float u_ShadowMinBias;
+uniform int u_ShadowPCFRadius;
+```
+
+**Main logic**:
+```glsl
+void main(void) {
+    vec4 textureColor = texture(u_TextureArraySampler, v_TexCoords);
+    
+    // Alpha test for transparency
+    if (textureColor.a <= 0.5) {
+        discard;
+    }
+    
+    // Calculate shadow factor (see shadows.mdx)
+    float shadowFactor = calculateShadowFactor(v_Position, v_ViewDepth);
+    
+    // Combine texture, lighting, and shadows
+    fragColor = textureColor * vec4(v_Light * shadowFactor, 1.0);
+}
+```
+
+See `assets/shaders/colored_lighting/frag.glsl:23-70` for the complete shadow calculation.
+
+### Shadow Rendering
+
+**Location**: `assets/shaders/shadow/`
+
+Depth-only shader for shadow map generation.
+
+#### Vertex Shader (`vert.glsl`)
+
+```glsl
+#version 330 core
+
+uniform ivec2 u_ChunkPosition;
+uniform mat4 u_LightSpaceMatrix;  // Light projection * view
+
+layout(location = 0) in uint a_Data0;
+layout(location = 1) in uint a_Data1;
+layout(location = 2) in uint a_Data2;
+
+out vec3 v_TexCoords;
+
+void main(void) {
+    // Decode position and UV (same format as main shader)
+    int px = decode_signed16(a_Data0);
+    int py = decode_signed16(a_Data0 >> 16);
+    int pz = decode_signed16(a_Data1);
+    
+    float u = float((a_Data1 >> 16) & 0xFFu) / 255.0;
+    float v = float((a_Data1 >> 24) & 0xFFu) / 255.0;
+    float layer = float(a_Data2 & 0xFFu);
+    
+    // Transform to world space
+    vec3 local_pos = vec3(px, py, pz) / 16.0;
+    vec3 world_pos = vec3(u_ChunkPosition.x * 16 + local_pos.x,
+                          local_pos.y,
+                          u_ChunkPosition.y * 16 + local_pos.z);
+    
+    v_TexCoords = vec3(u, v, layer);
+    gl_Position = u_LightSpaceMatrix * vec4(world_pos, 1.0);
+}
+```
+
+#### Fragment Shader (`frag.glsl`)
+
+```glsl
+#version 330 core
+
+in vec3 v_TexCoords;
+uniform sampler2DArray u_TextureArraySampler;
+
+void main(void) {
+    // Alpha test for foliage/transparent textures
+    vec4 tex = texture(u_TextureArraySampler, v_TexCoords);
+    if (tex.a < 0.5) discard;
+    
+    // Depth is written automatically to GL_DEPTH_ATTACHMENT
+}
+```
+
+No color output - only depth is written for shadow mapping.
+
+### Post-Processing
+
+**Location**: `assets/shaders/post/`
+
+Simple fullscreen quad shader for post-processing effects (currently used for framebuffer copy).
+
+### UI Rendering
+
+**Location**: `assets/shaders/ui/`
+
+Basic shader for UI elements and debug overlays.
+
+## Shader Conventions
+
+### Naming
+
+- **Uniforms**: Prefixed with `u_` (e.g., `u_MVPMatrix`)
+- **Vertex attributes**: Prefixed with `a_` (e.g., `a_Data0`)
+- **Varyings**: Prefixed with `v_` (e.g., `v_Position`)
+
+### Version
+
+All shaders use `#version 330` or `#version 330 core` (OpenGL 3.3).
+
+### Constants
+
+Shared constants are defined at the top of shaders:
+
+```glsl
+#define CHUNK_WIDTH 16
+#define CHUNK_LENGTH 16
+#define MAX_CASCADES 4
+```
+
+## Debugging Tips
+
+### Black Screen
+
+If blocks render black:
+1. Check `u_TextureArraySampler` is set to 0 (texture unit 0)
+2. Verify texture array is bound to `GL_TEXTURE0` before rendering
+3. Ensure shader is active when setting uniforms
+
+See `src/world.cpp:634-636` for correct texture sampler setup.
+
+### Shader Compilation Errors
+
+Errors are printed to stdout in format:
+```
+ERROR::SHADER::COMPILATION_FAILED (path/to/shader.glsl): 
+<OpenGL error log>
+```
+
+Common issues:
+- Missing uniform declarations
+- Type mismatches in uniform/attribute bindings
+- GLSL version incompatibilities
+
+## Related Pages
+
+- [Rendering Overview](/rendering/overview) - Full pipeline description
+- [Texture Management](/rendering/textures) - Texture array setup
+- [Shadow Mapping](/rendering/shadows) - CSM shader details
+- [Lighting System](/rendering/lighting) - Colored lighting model

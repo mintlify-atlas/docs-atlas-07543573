@@ -1,0 +1,212 @@
+---
+title: "Entity"
+description: "Entity class API reference - physics-based entity with collision detection and movement"
+---
+
+# Entity
+
+The `Entity` class provides physics-based entity simulation with AABB collision detection, gravity, friction, and step assist.
+
+## Class Definition
+
+```cpp
+class Entity {
+public:
+    World* world;
+    glm::vec3 position;
+    glm::vec3 old_position;     // For interpolation
+    glm::vec2 rotation;
+    glm::vec3 velocity;
+    glm::vec3 accel;
+    Collider collider;
+
+    float width = 0.6f;
+    float height = 1.8f;
+    bool grounded = false;
+    bool flying = false;
+    float step_offset = 0.0f;   // Smooth step animation
+
+    Entity(World* w);
+    virtual void update(float dt);
+    void update_collider();
+    void jump();
+};
+```
+
+## Constructor
+
+### Entity(World* w)
+
+Creates a new entity in the given world.
+
+**Parameters:**
+- `w` - Pointer to the World instance
+
+**Initial state:**
+- Position: `(0, 80, 0)`
+- Rotation: `(-1.57, 0)` (pitch, yaw)
+- Velocity and acceleration: zero vectors
+
+```cpp
+Entity::Entity(World* w) 
+    : world(w), 
+      position(0, 80, 0), 
+      old_position(0, 80, 0), 
+      rotation(-1.57, 0), 
+      velocity(0), 
+      accel(0) {}
+```
+
+## Methods
+
+### void update(float dt)
+
+Updates entity physics for the current frame.
+
+**Parameters:**
+- `dt` - Delta time in seconds
+
+**Physics pipeline:**
+1. Saves old position for interpolation
+2. Applies smooth step offset decay
+3. Applies input acceleration with friction
+4. Performs 3-pass collision detection and resolution
+5. Applies gravity (configurable for flying mode)
+6. Applies velocity decay based on movement state
+
+**Collision detection:**
+- Broad-phase: searches blocks in movement direction
+- Sweep test: uses AABB collision with velocity vector
+- Step assist: automatically steps up blocks ≤0.6 units high when grounded
+- Early exit offset: -0.001 to prevent edge sticking
+
+```cpp
+void Entity::update(float dt) {
+    old_position = position;
+    
+    // Step offset smooth decay
+    if (step_offset < 0.0f) {
+        step_offset += dt * 8.0f;
+        if (step_offset > 0.0f) step_offset = 0.0f;
+    }
+    
+    // Apply friction and acceleration
+    glm::vec3 f_vec = get_friction_vector(flying, grounded, velocity.y);
+    velocity += accel * f_vec * dt;
+    accel = glm::vec3(0);
+    
+    // Collision resolution (3 passes)
+    // ... sweep tests with block colliders ...
+    
+    // Apply remaining velocity
+    position += velocity * dt;
+    
+    // Apply gravity
+    glm::vec3 gravity = flying ? FLYING_ACCEL : GRAVITY_ACCEL;
+    velocity += gravity * dt;
+    
+    // Apply decay
+    // ... friction/drag based on movement state ...
+    
+    update_collider();
+}
+```
+
+### void update_collider()
+
+Recalculates the entity's AABB collider based on current position and dimensions.
+
+**Collider bounds:**
+- Min: `position - vec3(width/2, 0, width/2)`
+- Max: `position + vec3(width/2, height, width/2)`
+
+```cpp
+void Entity::update_collider() {
+    collider = Collider(
+        position - glm::vec3(width/2, 0, width/2),
+        position + glm::vec3(width/2, height, width/2)
+    );
+}
+```
+
+### void jump()
+
+Applies upward velocity for jumping (only when grounded).
+
+**Jump mechanics:**
+- Jump height: 1.25 blocks
+- Initial velocity: `sqrt(2 * height * gravity)` ≈ 8.0 m/s
+- Only activates when `grounded == true`
+
+```cpp
+void Entity::jump() {
+    if (grounded) {
+        float jump_height = 1.25f;
+        velocity.y = sqrt(2 * jump_height * 32.0f);
+    }
+}
+```
+
+## Physics Constants
+
+```cpp
+const glm::vec3 GRAVITY_ACCEL(0.0f, -32.0f, 0.0f);
+const glm::vec3 FLYING_ACCEL(0.0f, 0.0f, 0.0f);
+const glm::vec3 FRICTION(20.0f, 20.0f, 20.0f);      // Ground friction
+const glm::vec3 DRAG_FLY(5.0f, 5.0f, 5.0f);         // Air drag (flying)
+const glm::vec3 DRAG_JUMP(1.8f, 0.0f, 1.8f);        // Air drag (rising)
+const glm::vec3 DRAG_FALL(1.8f, 0.4f, 1.8f);        // Air drag (falling)
+```
+
+## Step Assist Feature
+
+When the entity collides horizontally while grounded and not flying, the system automatically lifts the entity by up to 0.6 blocks if there's clearance above:
+
+```cpp
+float step_height = 0.6f;
+Collider step_collider = collider + glm::vec3(adj_vel.x, step_height, adj_vel.z);
+
+// Check if step clearance is available
+if (!blocked) {
+    position.y += step_height;
+    step_offset -= step_height;  // Compensate visually
+    old_position.y += step_height;
+}
+```
+
+The `step_offset` field smoothly animates the camera back down at 8 units/second to hide the instant physics jump.
+
+## Collision Resolution
+
+The entity performs **3 collision passes** per frame to resolve complex geometry:
+
+1. **Broad-phase search**: Scans blocks in a bounding box around movement path
+2. **Sweep test**: For each block collider, performs AABB sweep with `Collider::collide()`
+3. **Normal-based resolution**: Zeroes velocity component along collision normal
+
+```cpp
+for (int i = 0; i < 3; i++) {
+    // Search blocks in movement direction
+    for (int bx = ...; bx <= ...; bx++) {
+        for (int by = ...; by <= ...; by++) {
+            for (int bz = ...; bz <= ...; bz++) {
+                int num = world->get_block_number({bx, by, bz});
+                for (auto& col_offset : world->block_types[num]->colliders) {
+                    auto res = collider.collide(
+                        col_offset + glm::vec3(bx, by, bz), 
+                        adj_vel
+                    );
+                    // Track earliest collision
+                }
+            }
+        }
+    }
+    // Apply collision and zero velocity along normal
+}
+```
+
+## See Also
+
+- [Collider](/api/collider) - AABB collision detection struct
+- [Player](/api/player) - Player entity subclass
+- [World](/api/world) - World container and block access

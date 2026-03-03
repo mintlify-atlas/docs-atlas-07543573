@@ -1,80 +1,279 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+title: Quickstart Guide
+description: Get MC-CPP running and learn the basic controls to start exploring
 ---
 
-## Get started in three steps
+This guide assumes you've already [built the project](/building). Let's get you into the game!
 
-Get your documentation site running locally and make your first customization.
+## Running the Game
 
-### Step 1: Set up your local environment
-
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
+<Steps>
+  <Step title="Navigate to Build Directory">
+    ```bash
+    cd build
+    ```
     
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
+    The executable and assets should all be in this directory after building.
+  </Step>
+
+  <Step title="Launch MC-CPP">
+    <CodeGroup>
     
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
-
-### Step 2: Deploy your changes
-
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
+    ```bash Windows
+    .\MC-CPP.exe
+    ```
     
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+    ```bash Linux
+    ./MC-CPP
+    ```
+    
+    ```bash macOS
+    ./MC-CPP
+    ```
+    
+    </CodeGroup>
+    
+    <Note>
+    On first launch, a startup menu will appear for adjusting music volume before entering the game.
+    </Note>
+  </Step>
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+  <Step title="Start Playing">
+    Once in-game, the mouse will be captured for camera control. Use ESC to release the cursor.
+  </Step>
+</Steps>
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+## Basic Controls
 
-### Step 3: Go live
+### Movement
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+| Key | Action |
+|-----|--------|
+| **W** | Move forward |
+| **A** | Move left (strafe) |
+| **S** | Move backward |
+| **D** | Move right (strafe) |
+| **Space** | Jump |
+| **Left Shift** | Sprint (increases FOV dynamically) |
+| **Mouse** | Look around (captured mode) |
 
-## Next steps
+### Block Interaction
 
-Now that you have your docs running, explore these key features:
+| Control | Action |
+|---------|--------|
+| **Left Click** | Break block (raycast targeting) |
+| **Right Click** | Place block |
+| **Mouse Wheel** | Change selected block type |
 
-<CardGroup cols={2}>
+<Tip>
+The game uses physics-based collision detection - you can walk on blocks and jump between platforms naturally.
+</Tip>
 
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
+### World & Display
 
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
+| Key | Action |
+|-----|--------|
+| **F3** | Toggle debug overlay (FPS, position, render stats) |
+| **F11** | Toggle fullscreen mode |
+| **O** | Save world to `save/` directory (NBT format) |
+| **ESC** | Release/capture mouse cursor |
 
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
+## Understanding the Display
 
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
+### Crosshair
 
-</CardGroup>
+The white crosshair in the center indicates:
+- Your aiming point for block placement/breaking
+- The direction you're facing
+- Raycast hit detection for block interaction
+
+### Debug Overlay (F3)
+
+Press F3 to see detailed information:
+
+- **FPS** - Current frames per second
+- **Position** - Player coordinates (x, y, z)
+- **Rotation** - Camera pitch/yaw angles
+- **Chunks** - Visible/loaded chunk count
+- **Render distance** - Current setting from `Options::RENDER_DISTANCE`
+- **Shadow info** - Cascade count, resolution (if enabled)
+
+## World Saves
+
+MC-CPP uses NBT (Named Binary Tag) format with gzip compression for world persistence.
+
+### Save Location
+
+```
+build/
+├── MC-CPP          # Executable
+├── assets/         # Shaders, textures, audio
+├── data/           # Block definitions
+└── save/           # World chunks (created on first save)
+    └── *.dat       # Chunk files (NBT + gzip)
+```
+
+### Manual Save
+
+Press **O** to save all loaded chunks. The game also:
+- Saves chunks when unloading them (distance-based streaming)
+- Automatically loads nearby chunks as you move
+
+<Warning>
+World saves are tied to the `save/` directory in your build folder. Deleting it will reset your world.
+</Warning>
+
+## Performance Tuning
+
+You can adjust settings in `src/options.h` (source:/home/daytona/workspace/source/src/options.h:1) before building:
+
+### Render Distance
+
+```cpp
+inline int RENDER_DISTANCE = 8;  // Chunks (16x16x128 blocks each)
+```
+
+Higher values = more visible terrain but lower FPS. Recommended: 8-16.
+
+### Field of View
+
+```cpp
+inline float FOV = 90.0f;  // Degrees
+```
+
+Standard FPS range is 80-110. Sprint dynamically increases FOV.
+
+### Chunk Updates per Frame
+
+```cpp
+inline int CHUNK_UPDATES = 4;  // Subchunks per tick
+```
+
+Controls how many chunk meshes rebuild per frame. Lower = smoother FPS when streaming new terrain.
+
+### Lighting Performance
+
+```cpp
+inline int LIGHT_STEPS_PER_TICK = 2048;  // BFS steps per frame
+```
+
+Reduces lighting calculation stutters when loading new chunks. See `info.md` (source:/home/daytona/workspace/source/info.md:1) for details.
+
+### Shadow Quality
+
+```cpp
+inline bool SHADOWS_ENABLED = true;
+inline int SHADOW_MAP_RESOLUTION = 2048;  // Per-cascade
+inline int SHADOW_CASCADES = 4;           // 1-4 supported
+```
+
+Shadows use Cascaded Shadow Maps (CSM). Disable for +20-40% FPS on lower-end GPUs.
 
 <Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
+Changes to `options.h` require rebuilding the project:
+```bash
+cmake --build build --parallel
+```
 </Note>
+
+## Troubleshooting
+
+### Game Won't Launch
+
+**"Cannot find assets/"**:
+```bash
+# Ensure you're running from the build/ directory
+cd build
+./MC-CPP
+```
+
+**"OpenGL error" or black screen**:
+- Update GPU drivers
+- Verify OpenGL 3.3+ support:
+  ```bash
+  glxinfo | grep "OpenGL version"  # Linux
+  ```
+
+### Low FPS
+
+1. **Reduce render distance**: Edit `Options::RENDER_DISTANCE` to 4-6
+2. **Disable shadows**: Set `Options::SHADOWS_ENABLED = false`
+3. **Lower shadow resolution**: Change `SHADOW_MAP_RESOLUTION` to 1024
+4. **Disable VSync**: Set `Options::VSYNC = false` (may cause tearing)
+
+### Stuttering When Moving
+
+This is chunk streaming overhead. The game loads/unloads chunks as you explore:
+
+- **Already optimized**: `info.md` documents FPS improvements from asynchronous chunk building
+- Increase `CHUNK_UPDATES` (faster meshing, more CPU usage)
+- Increase `LIGHT_STEPS_PER_TICK` (faster lighting, more CPU usage)
+
+<Tip>
+The game uses incremental updates (source:/home/daytona/workspace/source/info.md:14) - new chunks build gradually over several frames to maintain smooth FPS.
+</Tip>
+
+### Missing Textures
+
+**Blocks appear black/magenta**:
+- Check `assets/textures/` exists in build directory
+- Verify `data/blocks.mccpp` is present
+- See AGENTS.md shadow debugging section (source:/home/daytona/workspace/source/AGENTS.md:110) for texture atlas issues
+
+## Advanced Features
+
+### Shadow System
+
+MC-CPP implements directional shadows with cascades:
+
+- **4 cascades** - Different resolutions for near/far objects
+- **PCF filtering** - Soft shadow edges (configurable radius)
+- **Dynamic updates** - Shadows follow sun direction (day/night cycle)
+
+See `AGENTS.md` (source:/home/daytona/workspace/source/AGENTS.md:16) for technical details on the CSM implementation.
+
+### Lighting System
+
+Two independent light sources:
+
+- **Skylight** - Top-down sunlight propagation
+- **Block light** - Emissive blocks (torches, lava, etc.)
+
+Both use BFS queues with incremental updates for smooth performance.
+
+### Physics
+
+Player movement uses:
+- **Gravity** with drag coefficients
+- **AABB collision** with swept tests
+- **Dynamic acceleration** (walk/sprint states)
+- **Interpolated rendering** for smooth motion at any FPS
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card
+    title="Explore the Source"
+    icon="code"
+  >
+    Check out `AGENTS.md` for a complete architecture overview
+  </Card>
+  <Card
+    title="Modify Block Types"
+    icon="cube"
+  >
+    Edit `data/blocks.mccpp` to add custom blocks
+  </Card>
+  <Card
+    title="Customize Shaders"
+    icon="wand-magic-sparkles"
+  >
+    Modify `assets/shaders/colored_lighting/` for visual effects
+  </Card>
+  <Card
+    title="Performance Profiling"
+    icon="gauge-high"
+  >
+    Run `mc_bench` to identify hotspots
+  </Card>
+</CardGroup>

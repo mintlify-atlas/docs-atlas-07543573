@@ -1,0 +1,359 @@
+---
+title: NBT Format
+description: NBT serialization, compression, and chunk data encoding
+---
+
+MC-CPP uses a minimal implementation of the Named Binary Tag (NBT) format with gzip compression for chunk persistence.
+
+## Overview
+
+The NBT implementation (`src/nbt_utils.h/cpp`) handles:
+
+- **Reading** compressed chunk data from disk
+- **Writing** chunk data with proper structure and compression
+- **Coordinate remapping** between engine and Minecraft formats
+- **Big-endian encoding** for compatibility
+
+## API
+
+```cpp
+namespace NBT {
+    // Read chunk blocks from gzipped NBT file
+    bool read_blocks_from_gzip(
+        const std::string& path, 
+        uint8_t* dest_buffer, 
+        size_t expected_size
+    );
+
+    // Write chunk blocks to gzipped NBT file
+    // Structure: Root -> Level -> Blocks (ByteArray)
+    bool write_blocks_to_gzip(
+        const std::string& path, 
+        const uint8_t* src_buffer, 
+        int width, 
+        int height, 
+        int length
+    );
+}
+```
+
+## File Structure
+
+Chunk files use the following NBT hierarchy:
+
+```
+Compound "" (root)
+  Compound "Level"
+    ByteArray "Blocks" [32768 bytes]
+  End
+End
+```
+
+For a standard 16×128×16 chunk:
+- Array length: `16 * 128 * 16 = 32768 bytes`
+- Each byte represents one block ID (0-255)
+
+## Coordinate Remapping
+
+The engine uses `blocks[x][y][z]` internally, but NBT uses Minecraft's standard format where **Y is the fastest-changing index**.
+
+### Minecraft NBT Order
+
+From `src/nbt_utils.cpp:81-90`:
+
+```cpp
+// Minecraft Standard Format (Pre-1.13/Anvil):
+// Index = y + (z * Height) + (x * Height * Width)
+// Y is the fastest changing index.
+
+for (int x = 0; x < 16; x++) {
+    for (int z = 0; z < 16; z++) {
+        for (int y = 0; y < 128; y++) {
+            // Calculate index in NBT file
+            int nbt_index = y + (z * 128) + (x * 128 * 16);
+            
+            if (nbt_index < array_len) {
+                blocks[x][y][z] = src[nbt_index];
+            }
+        }
+    }
+}
+```
+
+### Engine to NBT
+
+When writing (`src/nbt_utils.cpp:193-199`):
+
+```cpp
+// Convert blocks[x][y][z] to NBT format
+for (int x = 0; x < 16; x++) {
+    for (int z = 0; z < 16; z++) {
+        for (int y = 0; y < 128; y++) {
+            nbt.push_back(blocks[x][y][z]);
+        }
+    }
+}
+```
+
+The loop order (X→Z→Y) naturally produces the correct NBT layout.
+
+## Big-Endian Encoding
+
+NBT uses big-endian byte order for integers. Helper functions (`src/nbt_utils.cpp:8-21`):
+
+### Reading
+
+```cpp
+int16_t read_short_be(const uint8_t* data, size_t& offset) {
+    uint16_t val = ((uint16_t)data[offset] << 8) | (uint16_t)data[offset + 1];
+    offset += 2;
+    return (int16_t)val;
+}
+
+int32_t read_int_be(const uint8_t* data, size_t& offset) {
+    uint32_t val = ((uint32_t)data[offset] << 24) |
+                   ((uint32_t)data[offset + 1] << 16) |
+                   ((uint32_t)data[offset + 2] << 8) |
+                   (uint32_t)data[offset + 3];
+    offset += 4;
+    return (int32_t)val;
+}
+```
+
+### Writing
+
+```cpp
+void write_short_be(std::vector<uint8_t>& buf, int16_t val) {
+    buf.push_back((val >> 8) & 0xFF);
+    buf.push_back(val & 0xFF);
+}
+
+void write_int_be(std::vector<uint8_t>& buf, int32_t val) {
+    buf.push_back((val >> 24) & 0xFF);
+    buf.push_back((val >> 16) & 0xFF);
+    buf.push_back((val >> 8) & 0xFF);
+    buf.push_back(val & 0xFF);
+}
+
+void write_string(std::vector<uint8_t>& buf, const std::string& str) {
+    write_short_be(buf, (int16_t)str.size());
+    for(char c : str) buf.push_back(c);
+}
+```
+
+## Reading NBT Files
+
+The `read_blocks_from_gzip()` function (`src/nbt_utils.cpp:23-145`) implements:
+
+### 1. Decompression
+
+```cpp
+bool NBT::read_blocks_from_gzip(const std::string& path, uint8_t* dest_buffer, size_t expected_size) {
+    gzFile file = gzopen(path.c_str(), "rb");
+    if (!file) return false;
+    
+    // 512KB buffer for decompressed data
+    std::vector<uint8_t> buffer(512 * 1024);
+    int bytes_read = gzread(file, buffer.data(), buffer.size());
+    gzclose(file);
+    
+    if (bytes_read <= 0) return false;
+    
+    size_t cursor = 0;
+    // ... parsing ...
+}
+```
+
+### 2. Tag Parsing
+
+The parser skips the root compound and searches for the "Blocks" tag:
+
+```cpp
+// Skip root Compound tag (0x0A)
+if (safe_check(1) && buffer[cursor] == 0x0A) {
+    cursor++;
+    int16_t name_len = read_short_be(buffer.data(), cursor);
+    cursor += name_len;
+}
+
+// Iterate through tags to find "Blocks"
+while (safe_check(1)) {
+    uint8_t tagType = buffer[cursor++];
+    if (tagType == 0) break; // End Tag
+    
+    int16_t name_len = read_short_be(buffer.data(), cursor);
+    std::string tagName((char*)&buffer[cursor], name_len);
+    cursor += name_len;
+    
+    // Found "Blocks" ByteArray (tag type 7)
+    if (tagType == 7 && tagName == "Blocks") {
+        int32_t array_len = read_int_be(buffer.data(), cursor);
+        
+        if (array_len == expected_size) {
+            // Remap coordinates while copying
+            // ... (see Coordinate Remapping section)
+            return true;
+        }
+    }
+}
+```
+
+### 3. Fallback Brute-Force Search
+
+If structured parsing fails, the reader searches for the "Blocks" signature (`src/nbt_utils.cpp:117-142`):
+
+```cpp
+// Fallback: Brute-force search for "Blocks" signature
+const uint8_t header[] = {0x07, 0x00, 0x06, 'B', 'l', 'o', 'c', 'k', 's'};
+//                        ^tag  ^len (6)  ^name bytes
+
+for (size_t i = 0; i < bytes_read - sizeof(header) - 4; ++i) {
+    if (std::memcmp(&buffer[i], header, sizeof(header)) == 0) {
+        size_t data_offset = i + sizeof(header);
+        int32_t len = read_int_be(buffer.data(), data_offset);
+        
+        if (len == expected_size) {
+            // Apply coordinate remapping
+            // ...
+            return true;
+        }
+    }
+}
+```
+
+This allows loading chunks even if the NBT structure is slightly non-standard.
+
+## Writing NBT Files
+
+The `write_blocks_to_gzip()` function (`src/nbt_utils.cpp:166-213`) constructs the NBT structure:
+
+### 1. Build NBT Structure
+
+```cpp
+bool NBT::write_blocks_to_gzip(const std::string& path, const uint8_t* src_buffer, 
+                               int width, int height, int length) {
+    std::vector<uint8_t> nbt;
+    
+    // Root Compound (Tag 10) - Name ""
+    nbt.push_back(0x0A);
+    write_string(nbt, "");
+    
+    // "Level" Compound (Tag 10)
+    nbt.push_back(0x0A);
+    write_string(nbt, "Level");
+    
+    // "Blocks" ByteArray (Tag 7)
+    nbt.push_back(0x07);
+    write_string(nbt, "Blocks");
+    
+    // Array Length
+    int32_t size = width * height * length;  // 32768 for 16x128x16
+    write_int_be(nbt, size);
+    
+    // Data with coordinate remapping
+    using BlockArray = uint8_t[16][128][16];
+    const BlockArray& blocks = *reinterpret_cast<const BlockArray*>(src_buffer);
+    
+    for (int x = 0; x < 16; x++) {
+        for (int z = 0; z < 16; z++) {
+            for (int y = 0; y < 128; y++) {
+                nbt.push_back(blocks[x][y][z]);
+            }
+        }
+    }
+    
+    // End Tags
+    nbt.push_back(0x00); // End "Level"
+    nbt.push_back(0x00); // End Root
+    
+    // ... compression ...
+}
+```
+
+### 2. Gzip Compression
+
+```cpp
+// Write to gzip file
+gzFile file = gzopen(path.c_str(), "wb");
+if (!file) return false;
+
+int written = gzwrite(file, nbt.data(), nbt.size());
+gzclose(file);
+
+return (written > 0);
+```
+
+## Tag Types
+
+The implementation uses these NBT tag types:
+
+| Type | ID | Description |
+|------|----|--------------|
+| End | 0 | Marks end of compound |
+| ByteArray | 7 | Array of bytes (block data) |
+| Compound | 10 (0x0A) | Named container for tags |
+
+Other tag types (Int, String, List, etc.) are not implemented as they're not needed for chunk storage.
+
+## Usage Example
+
+From `src/save.cpp:58-62` (saving):
+
+```cpp
+bool success = NBT::write_blocks_to_gzip(
+    filename,
+    (const uint8_t*)chunk->blocks,
+    CHUNK_WIDTH,    // 16
+    CHUNK_HEIGHT,   // 128
+    CHUNK_LENGTH    // 16
+);
+
+if (success) {
+    chunk->modified = false;
+}
+```
+
+From `src/save.cpp:114-117` (loading):
+
+```cpp
+if (fs::exists(nbt_path)) {
+    if (NBT::read_blocks_from_gzip(nbt_path, (uint8_t*)c->blocks, sizeof(c->blocks))) {
+        loaded = true;
+    }
+}
+```
+
+## Error Handling
+
+Both functions return `bool` to indicate success/failure:
+
+- **Read failures**: File not found, decompression error, wrong size, parse error
+- **Write failures**: Cannot open file, gzwrite error
+
+The save system falls back to legacy binary format if NBT reading fails (`src/save.cpp:121-130`).
+
+## Compression Details
+
+Using zlib's gzip interface:
+
+- **Read**: `gzopen(path, "rb")` + `gzread()`
+- **Write**: `gzopen(path, "wb")` + `gzwrite()`
+- **Buffer size**: 512KB for decompression
+- **Compression level**: Default (zlib automatic)
+
+Typical compression ratio for chunk data: ~4:1 to 8:1 depending on block variety.
+
+## Performance Considerations
+
+1. **Synchronous I/O**: All file operations are blocking
+   - Chunk saves during unload can cause brief hitches
+   - Consider async I/O for production use
+
+2. **Memory allocation**: 512KB decompression buffer per read
+   - Reusable buffer could reduce allocations
+
+3. **Coordinate remapping**: Inner loop executes 32,768 times per chunk
+   - Could be optimized with memcpy + in-place swizzle
+
+4. **Fallback search**: Scans entire decompressed buffer if parsing fails
+   - Usually not needed for well-formed files

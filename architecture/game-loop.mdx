@@ -1,0 +1,466 @@
+---
+title: Game Loop
+description: Detailed breakdown of the main game loop and frame execution in MC-CPP
+---
+
+The game loop in `src/main.cpp` follows a classic structure: initialize, run the update/render loop, and clean up. The implementation uses a delta-time approach with frame timing to ensure smooth gameplay.
+
+## Initialization Sequence
+
+### 1. GLFW and OpenGL Setup
+
+```cpp src/main.cpp
+glfwInit();
+glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+
+GLFWwindow* window = glfwCreateWindow(SCR_WIDTH, SCR_HEIGHT, GAME_TITLE.c_str(), NULL, NULL);
+glfwMakeContextCurrent(window);
+gladLoadGLLoader((GLADloadproc)glfwGetProcAddress);
+```
+
+The engine targets OpenGL 3.3 Core Profile, ensuring compatibility with modern graphics drivers while avoiding legacy fixed-function pipeline.
+
+### 2. Window Icon and Input Callbacks
+
+```cpp src/main.cpp
+// Load window icon
+int width, height, channels;
+unsigned char* pixels = stbi_load("assets/Icon.png", &width, &height, &channels, 4);
+if (pixels) {
+    GLFWimage images[1];
+    images[0] = {width, height, pixels};
+    glfwSetWindowIcon(window, 1, images);
+    stbi_image_free(pixels);
+}
+
+// Register callbacks
+glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
+glfwSetCursorPosCallback(window, mouse_callback);
+glfwSetMouseButtonCallback(window, mouse_button_callback);
+glfwSetKeyCallback(window, key_callback);
+```
+
+### 3. Rendering Resources
+
+```cpp src/main.cpp
+// Enable depth testing and face culling
+glEnable(GL_DEPTH_TEST);
+glEnable(GL_CULL_FACE);
+
+// Initialize UI components
+init_crosshair();
+init_ui_resources();
+text_renderer = new TextRenderer(SCR_WIDTH, SCR_HEIGHT);
+text_renderer->Load("assets/font.ttf", 24);
+post_processor = new PostProcessor(SCR_WIDTH, SCR_HEIGHT);
+```
+
+### 4. Startup Menu (Music Volume)
+
+Before entering the game, a simple menu allows adjusting music volume:
+
+```cpp src/main.cpp
+float menu_volume = Audio::GetVolume();
+while (!glfwWindowShouldClose(window) && in_menu) {
+    glfwPollEvents();
+    
+    // A/D or Arrow keys adjust volume
+    if (glfwGetKey(window, GLFW_KEY_LEFT) == GLFW_PRESS)
+        menu_volume = std::clamp(menu_volume - menu_dt * 0.5f, 0.0f, 1.0f);
+    if (glfwGetKey(window, GLFW_KEY_RIGHT) == GLFW_PRESS)
+        menu_volume = std::clamp(menu_volume + menu_dt * 0.5f, 0.0f, 1.0f);
+    
+    // Enter/Space to start
+    if (glfwGetKey(window, GLFW_KEY_ENTER) == GLFW_PRESS)
+        in_menu = false;
+    
+    // Render menu UI
+    text_renderer->RenderText(GAME_TITLE, 40.0f, 80.0f, 1.6f, glm::vec3(1.0f));
+    text_renderer->RenderText("Music volume: " + std::to_string(percent) + "%", ...);
+}
+```
+
+### 5. World and Player Instantiation
+
+```cpp src/main.cpp
+Shader shader("assets/shaders/colored_lighting/vert.glsl", 
+              "assets/shaders/colored_lighting/frag.glsl");
+TextureManager tm(16, 16, 256); // 16x16 textures, 256 layers
+
+World world(&shader, &tm, nullptr);
+Player player(&world, &shader, SCR_WIDTH, SCR_HEIGHT);
+world.player = &player;
+
+load_blocks(world, tm); // Parse data/blocks.mccpp
+tm.generate_mipmaps();
+
+world.save_system = new Save(&world);
+world.save_system->load();
+
+Audio::Init();
+```
+
+<Note>
+The `load_blocks` function parses `data/blocks.mccpp`, which maps numeric block IDs to models (cube, plant, liquid, etc.) and texture assignments. Block types are registered in `world.block_types`.
+</Note>
+
+## Main Game Loop
+
+The core loop runs every frame until the window closes:
+
+```cpp src/main.cpp
+double lastTime = glfwGetTime();
+int frames = 0;
+float fps_display = 0.0f;
+
+while (!glfwWindowShouldClose(window)) {
+    double now = glfwGetTime();
+    double dt = now - lastTime;
+    lastTime = now;
+    if (dt > 0.1) dt = 0.1; // Clamp to avoid giant steps
+    
+    // ... update, render, swap
+}
+```
+
+### Frame Timing
+
+```cpp src/main.cpp
+// Delta time calculation with clamping
+if (dt > 0.1) dt = 0.1; // Max 100ms step to avoid physics explosions
+```
+
+This prevents spiral-of-death scenarios where slow frames cause even slower physics updates.
+
+### Update Phase
+
+#### 1. Input Handling
+
+```cpp src/main.cpp
+player.input = glm::vec3(0);
+if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) { player.input.z += 1; }
+if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) { player.input.z -= 1; }
+if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS) { player.input.x -= 1; }
+if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS) { player.input.x += 1; }
+if (glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS) { player.input.y += 1; }
+if (glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS && player.flying) 
+    { player.input.y -= 1; }
+
+bool ctrl = (glfwGetKey(window, GLFW_KEY_LEFT_CONTROL) == GLFW_PRESS);
+player.handle_input_sprint(ctrl, player.input.z > 0);
+```
+
+<Tip>
+Input is polled every frame and stored as a direction vector. The `Player` class converts this to acceleration based on view rotation.
+</Tip>
+
+#### 2. Player Physics Update
+
+```cpp src/main.cpp
+player.update(static_cast<float>(dt));
+```
+
+Inside `player.update()`:
+- Apply gravity and drag
+- Integrate velocity
+- Perform collision detection with block AABBs
+- Update interpolated position for smooth rendering
+
+#### 3. World Tick
+
+```cpp src/main.cpp
+world.tick(static_cast<float>(dt));
+```
+
+```cpp src/world.cpp
+void World::tick(float dt) {
+    chunk_update_counter = 0;
+    time++;
+    
+    // Day/night cycle (sinusoidal)
+    double phase = std::fmod(static_cast<double>(time) + 9000.0, 36000.0) / 36000.0;
+    float sun_height = static_cast<float>(0.5 * (std::sin(phase * glm::two_pi<double>()) + 1.0));
+    daylight = glm::mix(480.0f, 1800.0f, sun_height);
+    
+    // Process one chunk mesh build per tick
+    if (!chunk_building_queue.empty()) {
+        chunk_building_queue.front()->update_mesh();
+        chunk_building_queue.pop_front();
+    }
+    
+    // Update visible chunk meshes
+    for (auto* c : visible_chunks) c->process_chunk_updates();
+    
+    // Incremental light propagation
+    propagate_increase(true);
+    propagate_decrease(true);
+    propagate_skylight_increase(true);
+    propagate_skylight_decrease(true);
+}
+```
+
+**Key operations in `world.tick`:**
+- Advance day/night cycle (36000 ticks = 1 day)
+- Build one queued chunk mesh
+- Process subchunk mesh updates
+- Propagate lighting changes (limited steps per tick)
+
+#### 4. Audio Update
+
+```cpp src/main.cpp
+Audio::Update(static_cast<float>(dt));
+```
+
+Handles randomized music playback with timing logic.
+
+#### 5. Chunk Streaming
+
+```cpp src/main.cpp
+if (world.save_system) {
+    world.save_system->update_streaming(player.position);
+    world.save_system->stream_next(1); // Load 1 chunk per frame
+}
+```
+
+Gradually loads chunks near the player and unloads distant ones.
+
+### Render Phase
+
+#### 1. Camera Matrices
+
+```cpp src/main.cpp
+shader.use();
+player.update_matrices(1.0f);
+```
+
+```cpp src/entity/player.cpp
+void Player::update_matrices(float partial_ticks) {
+    float fov = get_current_fov(); // Adjusts for sprint
+    p_matrix = glm::perspective(glm::radians(fov), 
+                                view_width / view_height, 
+                                near_plane, far_plane);
+    
+    mv_matrix = glm::mat4(1.0f);
+    mv_matrix = glm::rotate(mv_matrix, rotation.y, glm::vec3(1, 0, 0)); // Pitch
+    mv_matrix = glm::rotate(mv_matrix, rotation.x + 1.57f, glm::vec3(0, 1, 0)); // Yaw
+    mv_matrix = glm::translate(mv_matrix, -(interpolated_position + glm::vec3(0, eyelevel, 0)));
+    
+    vp_matrix = p_matrix * mv_matrix;
+    
+    // Upload to shader
+    shader->setMat4(shader->find_uniform("u_MVPMatrix"), vp_matrix);
+    shader->setMat4(shader->find_uniform("u_ViewMatrix"), mv_matrix);
+}
+```
+
+<Warning>
+`player.update_matrices()` assumes the correct shader is already bound. `main.cpp` calls `shader.use()` immediately before.
+</Warning>
+
+#### 2. Visibility Culling
+
+```cpp src/main.cpp
+world.prepare_rendering();
+```
+
+```cpp src/world.cpp
+void World::prepare_rendering() {
+    visible_chunks.clear();
+    std::vector<std::pair<float, Chunk*>> candidates;
+    
+    for (auto& kv : chunks) {
+        glm::vec3 center = kv.second->position + 
+                           glm::vec3(CHUNK_WIDTH * 0.5f, CHUNK_HEIGHT * 0.5f, CHUNK_LENGTH * 0.5f);
+        float dist2 = glm::length2(player->position - center);
+        candidates.push_back({dist2, kv.second});
+    }
+    
+    // Sort farthest to nearest
+    std::sort(candidates.begin(), candidates.end(), 
+              [](const auto& a, const auto& b) { return a.first > b.first; });
+    
+    for (auto& c : candidates) visible_chunks.push_back(c.second);
+}
+```
+
+Chunks are sorted by distance for proper translucent rendering (back-to-front).
+
+#### 3. Shadow Pass (CSM)
+
+```cpp src/main.cpp
+world.render_shadows();
+```
+
+Renders depth into a `GL_TEXTURE_2D_ARRAY` with 4 cascades. See the [Shadow Mapping documentation](/rendering/shadows) for detailed CSM notes.
+
+#### 4. Main Draw
+
+```cpp src/main.cpp
+float daylight_factor = world.get_daylight_factor();
+glClearColor(0.5f * daylight_factor, 0.8f * daylight_factor, 1.0f * daylight_factor, 1.0f);
+
+post_processor->beginRender(); // Render to FBO
+
+shader.use();
+glActiveTexture(GL_TEXTURE0);
+glBindTexture(GL_TEXTURE_2D_ARRAY, tm.texture_array);
+
+world.draw(); // Opaque + translucent
+```
+
+```cpp src/world.cpp
+void World::draw() {
+    shader->use();
+    shader->setFloat(shader_daylight_loc, get_daylight_factor());
+    
+    // Ensure texture sampler is on unit 0
+    shader->setInt(shader->find_uniform("u_TextureArraySampler"), 0);
+    
+    // Upload shadow uniforms if enabled
+    if (shadows_enabled && shadow_map) {
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D_ARRAY, shadow_map);
+        shader->setInt(shader_shadow_map_loc, 1);
+        shader->setMat4Array(shader_light_space_mats_loc, shadow_matrices);
+        // ... other shadow uniforms
+    }
+    
+    // Draw opaque chunks
+    for (auto* c : visible_chunks) c->draw(GL_TRIANGLES);
+    
+    draw_translucent();
+}
+```
+
+#### 5. Post-Processing
+
+```cpp src/main.cpp
+glm::ivec3 headPos = glm::round(player.interpolated_position + glm::vec3(0, player.eyelevel, 0));
+int headBlock = world.get_block_number(headPos);
+bool isUnderwater = (headBlock == 8 || headBlock == 9); // Water blocks
+
+post_processor->endRenderAndDraw(isUnderwater, static_cast<float>(now));
+```
+
+Applies fullscreen shader effects like underwater distortion.
+
+#### 6. UI Overlay
+
+```cpp src/main.cpp
+draw_crosshair();
+draw_health_bar();
+draw_f3_screen(fps_display);
+```
+
+- **Crosshair**: Inverted-color cursor at screen center
+- **Health Bar**: Triangle-based hearts in bottom-left
+- **F3 Screen**: Debug overlay with position, chunk coords, FPS, light levels
+
+#### 7. Swap Buffers
+
+```cpp src/main.cpp
+glfwSwapBuffers(window);
+glfwPollEvents();
+```
+
+### FPS Counter
+
+```cpp src/main.cpp
+frames++;
+if (glfwGetTime() - fps_timer > 1.0) {
+    fps_display = frames;
+    frames = 0;
+    fps_timer = glfwGetTime();
+}
+```
+
+Updates once per second for stable display.
+
+## Input Callbacks
+
+### Mouse Movement
+
+```cpp src/main.cpp
+void mouse_callback(GLFWwindow* window, double xpos, double ypos) {
+    if (in_menu || !mouse_captured) return;
+    
+    double xoffset = xpos - lastX;
+    double yoffset = lastY - ypos; // Inverted Y
+    lastX = xpos;
+    lastY = ypos;
+    
+    player_ptr->rotation.x += xoffset * 0.002; // Yaw
+    player_ptr->rotation.y += yoffset * 0.002; // Pitch
+    
+    // Clamp pitch to ±90°
+    if (player_ptr->rotation.y > 1.57f) player_ptr->rotation.y = 1.57f;
+    if (player_ptr->rotation.y < -1.57f) player_ptr->rotation.y = -1.57f;
+}
+```
+
+### Mouse Buttons (Block Interaction)
+
+```cpp src/main.cpp
+void mouse_button_callback(GLFWwindow* window, int button, int action, int mods) {
+    if (action != GLFW_PRESS || in_menu) return;
+    
+    HitRay ray(world_ptr, player_ptr->rotation, 
+               player_ptr->interpolated_position + glm::vec3(0, player_ptr->eyelevel, 0));
+    
+    auto callback = [&](glm::ivec3 curr, glm::ivec3 next) {
+        if (button == GLFW_MOUSE_BUTTON_LEFT)
+            world_ptr->try_set_block(next, 0, player_ptr->collider); // Break
+        else if (button == GLFW_MOUSE_BUTTON_RIGHT)
+            world_ptr->try_set_block(curr, holding_block, player_ptr->collider); // Place
+        else if (button == GLFW_MOUSE_BUTTON_MIDDLE)
+            holding_block = world_ptr->get_block_number(next); // Pick
+    };
+    
+    while (ray.distance < 5.0f) if (ray.step(callback)) break;
+}
+```
+
+### Keyboard
+
+```cpp src/main.cpp
+void key_callback(GLFWwindow* window, int key, int scancode, int action, int mods) {
+    if (action != GLFW_PRESS) return;
+    
+    if (key == GLFW_KEY_ESCAPE) {
+        mouse_captured = false;
+        glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+    }
+    if (key >= GLFW_KEY_1 && key <= GLFW_KEY_9)
+        holding_block = key - GLFW_KEY_0;
+    if (key == GLFW_KEY_F)
+        player_ptr->flying = !player_ptr->flying;
+    if (key == GLFW_KEY_F3)
+        show_f3 = !show_f3;
+    if (key == GLFW_KEY_O) {
+        world_ptr->save_system->save();
+    }
+    if (key == GLFW_KEY_F11) {
+        // Toggle fullscreen
+    }
+}
+```
+
+## Performance Considerations
+
+- **Delta Time Clamping**: Prevents physics breakage on frame drops
+- **Incremental Operations**: Lighting and chunk meshing spread across frames
+- **Lazy GPU Upload**: Chunks only upload VBO when mesh changes
+- **Chunk Streaming**: Loads 1 chunk per frame to avoid stutters
+
+## Related Topics
+
+<CardGroup cols={2}>
+  <Card title="World System" icon="globe" href="/architecture/world-system">
+    Detailed world management and chunk systems
+  </Card>
+  <Card title="Architecture Overview" icon="sitemap" href="/architecture/overview">
+    Return to high-level architecture overview
+  </Card>
+</CardGroup>

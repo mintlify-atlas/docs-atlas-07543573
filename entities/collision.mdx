@@ -1,0 +1,398 @@
+---
+title: Collision Detection
+description: AABB collision detection with swept collision tests and ray casting for block targeting
+---
+
+## Overview
+
+MC-CPP uses **AABB (Axis-Aligned Bounding Box)** collision detection with swept tests for continuous collision detection. The system includes:
+
+- `Collider` class for AABB operations and swept collision
+- `HitRay` class for ray-casting to find targeted blocks
+
+## Collider Class
+
+**Location:** `src/physics/collider.h`
+
+The `Collider` class represents an axis-aligned bounding box and performs swept collision tests.
+
+### Structure
+
+```cpp
+class Collider {
+public:
+    float x1, y1, z1;  // Min corner
+    float x2, y2, z2;  // Max corner
+
+    Collider(glm::vec3 pos1 = glm::vec3(0), glm::vec3 pos2 = glm::vec3(0));
+    Collider operator+(const glm::vec3& pos) const;
+    bool operator&(const Collider& other) const;
+    std::pair<float, glm::vec3> collide(const Collider& static_col, const glm::vec3& velocity);
+};
+```
+
+### Constructor
+
+At `collider.h:12-15`:
+
+```cpp
+Collider(glm::vec3 pos1 = glm::vec3(0), glm::vec3 pos2 = glm::vec3(0)) {
+    x1 = pos1.x; y1 = pos1.y; z1 = pos1.z;
+    x2 = pos2.x; y2 = pos2.y; z2 = pos2.z;
+}
+```
+
+**Parameters:**
+- `pos1` – Minimum corner (x1, y1, z1)
+- `pos2` – Maximum corner (x2, y2, z2)
+
+### Translation Operator
+
+At `collider.h:17-20`, the `+` operator translates the collider:
+
+```cpp
+Collider operator+(const glm::vec3& pos) const {
+    return Collider(glm::vec3(x1 + pos.x, y1 + pos.y, z1 + pos.z),
+                    glm::vec3(x2 + pos.x, y2 + pos.y, z2 + pos.z));
+}
+```
+
+**Usage:**
+```cpp
+Collider block_col = base_collider + glm::vec3(10, 64, 10);  // Move to block position
+```
+
+### Intersection Test
+
+At `collider.h:22-27`, the `&` operator tests for overlap:
+
+```cpp
+bool operator&(const Collider& other) const {
+    float x = std::min(x2, other.x2) - std::max(x1, other.x1);
+    float y = std::min(y2, other.y2) - std::max(y1, other.y1);
+    float z = std::min(z2, other.z2) - std::max(z1, other.z1);
+    return x > 0 && y > 0 && z > 0;
+}
+```
+
+**Returns:**
+- `true` if the two AABBs overlap
+- `false` otherwise
+
+**Algorithm:**
+- Computes overlap distance on each axis
+- Boxes intersect only if all three overlaps are positive
+
+### Swept Collision Detection
+
+At `collider.h:29-60`, the `collide()` method performs **swept AABB** collision:
+
+```cpp
+std::pair<float, glm::vec3> collide(const Collider& static_col, const glm::vec3& velocity) {
+    float vx = velocity.x;
+    float vy = velocity.y;
+    float vz = velocity.z;
+
+    // Helper: compute time to reach position
+    auto time_func = [](float x, float y) -> float {
+        if (y == 0) return (x > 0) ? -infinity : infinity;
+        return x / y;
+    };
+
+    // Compute entry and exit times for each axis
+    float x_entry = time_func(vx > 0 ? static_col.x1 - x2 : static_col.x2 - x1, vx);
+    float x_exit = time_func(vx > 0 ? static_col.x2 - x1 : static_col.x1 - x2, vx);
+    float y_entry = time_func(vy > 0 ? static_col.y1 - y2 : static_col.y2 - y1, vy);
+    float y_exit = time_func(vy > 0 ? static_col.y2 - y1 : static_col.y1 - y2, vy);
+    float z_entry = time_func(vz > 0 ? static_col.z1 - z2 : static_col.z2 - z1, vz);
+    float z_exit = time_func(vz > 0 ? static_col.z2 - z1 : static_col.z1 - z2, vz);
+
+    // Early reject if already past or won't reach
+    if (x_entry < 0 && y_entry < 0 && z_entry < 0) return { 1.0f, glm::vec3(0) };
+    if (x_entry > 1 || y_entry > 1 || z_entry > 1) return { 1.0f, glm::vec3(0) };
+
+    // Find first entry and last exit
+    float entry = std::max({x_entry, y_entry, z_entry});
+    float exit_ = std::min({x_exit, y_exit, z_exit});
+
+    // No collision if entry after exit
+    if (entry > exit_) return { 1.0f, glm::vec3(0) };
+
+    // Determine collision normal from entry axis
+    glm::vec3 normal(0);
+    if (entry == x_entry) normal.x = (vx > 0) ? -1 : 1;
+    else if (entry == y_entry) normal.y = (vy > 0) ? -1 : 1;
+    else normal.z = (vz > 0) ? -1 : 1;
+
+    return { entry, normal };
+}
+```
+
+**Parameters:**
+- `static_col` – The stationary AABB (e.g., a block)
+- `velocity` – Movement vector for this frame
+
+**Returns:**
+- `pair<float, glm::vec3>`:
+  - `first` – Time of impact (0.0 to 1.0), or 1.0 if no collision
+  - `second` – Surface normal of collision, or (0,0,0) if no collision
+
+**Algorithm:**
+
+1. **Compute entry/exit times** for each axis:
+   - Entry time = when moving box first touches static box on that axis
+   - Exit time = when moving box leaves static box on that axis
+   - If velocity is zero on an axis, entry/exit are ±infinity
+
+2. **Early rejection:**
+   - All entry times < 0 → already overlapping/past
+   - Any entry time > 1 → won't reach in this time step
+
+3. **Find collision time:**
+   - `entry = max(x_entry, y_entry, z_entry)` – when all axes are overlapping
+   - `exit = min(x_exit, y_exit, z_exit)` – when any axis stops overlapping
+   - If `entry > exit`, the ranges don't overlap → no collision
+
+4. **Determine normal:**
+   - Whichever axis has the largest entry time is the collision axis
+   - Normal points opposite to velocity direction on that axis
+
+**Example:**
+```cpp
+Collider entity(glm::vec3(0, 0, 0), glm::vec3(0.6, 1.8, 0.6));
+Collider block(glm::vec3(1, 0, 0), glm::vec3(2, 1, 1));
+glm::vec3 velocity(5, 0, 0);  // Moving right at 5 blocks/s
+
+auto [time, normal] = entity.collide(block, velocity);
+if (normal != glm::vec3(0)) {
+    // Collision at time * velocity distance
+    // normal = (-1, 0, 0) indicates hit block's left face
+}
+```
+
+## Ray Casting (HitRay)
+
+**Location:** `src/physics/hit.h`, `src/physics/hit.cpp`
+
+The `HitRay` class performs voxel ray-casting to find the block the player is looking at.
+
+### Structure
+
+```cpp
+class HitRay {
+public:
+    World* world;
+    glm::vec3 vector;      // Ray direction
+    glm::vec3 position;    // Current ray position
+    glm::ivec3 block;      // Current block coordinates
+    float distance;        // Distance traveled
+
+    HitRay(World* w, glm::vec2 rotation, glm::vec3 start_pos);
+    bool check(std::function<void(glm::ivec3, glm::ivec3)> callback, 
+               float dist, glm::ivec3 current, glm::ivec3 next);
+    bool step(std::function<void(glm::ivec3, glm::ivec3)> callback);
+};
+```
+
+### Constructor
+
+At `hit.cpp:5-14`:
+
+```cpp
+HitRay::HitRay(World* w, glm::vec2 rotation, glm::vec3 start_pos) : world(w) {
+    vector = glm::vec3(
+        cos(rotation.x) * cos(rotation.y),  // X from yaw & pitch
+                       sin(rotation.y),      // Y from pitch
+                       sin(rotation.x) * cos(rotation.y)   // Z from yaw & pitch
+    );
+    position = start_pos;
+    block = glm::round(position);
+    distance = 0;
+}
+```
+
+**Parameters:**
+- `rotation.x` – Yaw angle (horizontal rotation)
+- `rotation.y` – Pitch angle (vertical rotation)
+- `start_pos` – Starting position (usually player's eye position)
+
+**Computed:**
+- `vector` – Normalized ray direction from rotation angles
+- `block` – Initial block coordinates (rounded from position)
+
+### Check Method
+
+At `hit.cpp:16-26`, tests if next block is solid:
+
+```cpp
+bool HitRay::check(std::function<void(glm::ivec3, glm::ivec3)> callback, 
+                   float dist, glm::ivec3 current, glm::ivec3 next) {
+    if (world->get_block_number(next)) {
+        callback(current, next);
+        return true;  // Hit solid block
+    } else {
+        position += vector * dist;
+        block = next;
+        distance += dist;
+        return false;  // Continue ray
+    }
+}
+```
+
+### Step Method (DDA Traversal)
+
+At `hit.cpp:28-69`, implements **3D DDA (Digital Differential Analyzer)**:
+
+```cpp
+bool HitRay::step(std::function<void(glm::ivec3, glm::ivec3)> callback) {
+    float bx = block.x; float by = block.y; float bz = block.z;
+    glm::vec3 local = position - glm::vec3(block);
+
+    glm::vec3 sign;
+    glm::vec3 abs_vec = vector;
+
+    // Convert to absolute space for easier calculation
+    for (int i = 0; i < 3; i++) {
+        sign[i] = (vector[i] >= 0) ? 1.0f : -1.0f;
+        abs_vec[i] *= sign[i];
+        local[i] *= sign[i];
+    }
+
+    // Test X face
+    if (abs_vec.x) {
+        float x = 0.5;
+        float y = (0.5 - local.x) / abs_vec.x * abs_vec.y + local.y;
+        float z = (0.5 - local.x) / abs_vec.x * abs_vec.z + local.z;
+        if (y >= -0.5 && y <= 0.5 && z >= -0.5 && z <= 0.5) {
+            float dist = sqrt(pow(x - local.x, 2) + pow(y - local.y, 2) + pow(z - local.z, 2));
+            return check(callback, dist, block, block + glm::ivec3(sign.x, 0, 0));
+        }
+    }
+    
+    // Test Y face
+    if (abs_vec.y) {
+        float x = (0.5 - local.y) / abs_vec.y * abs_vec.x + local.x;
+        float y = 0.5;
+        float z = (0.5 - local.y) / abs_vec.y * abs_vec.z + local.z;
+        if (x >= -0.5 && x <= 0.5 && z >= -0.5 && z <= 0.5) {
+            float dist = sqrt(pow(x - local.x, 2) + pow(y - local.y, 2) + pow(z - local.z, 2));
+            return check(callback, dist, block, block + glm::ivec3(0, sign.y, 0));
+        }
+    }
+    
+    // Test Z face
+    if (abs_vec.z) {
+        float x = (0.5 - local.z) / abs_vec.z * abs_vec.x + local.x;
+        float y = (0.5 - local.z) / abs_vec.z * abs_vec.y + local.y;
+        float z = 0.5;
+        if (x >= -0.5 && x <= 0.5 && y >= -0.5 && y <= 0.5) {
+            float dist = sqrt(pow(x - local.x, 2) + pow(y - local.y, 2) + pow(z - local.z, 2));
+            return check(callback, dist, block, block + glm::ivec3(0, 0, sign.z));
+        }
+    }
+    return false;
+}
+```
+
+**Algorithm:**
+
+1. Convert position to **local block space** (0 to 1 within current block)
+2. Transform to **absolute space** where ray direction is positive (easier math)
+3. For each axis (X, Y, Z):
+   - Calculate where ray intersects the exit face on that axis
+   - Check if intersection point is within the face bounds
+   - If valid, this is the next block boundary
+4. Return the closest face intersection
+5. Callback receives:
+   - `current` – Last air block
+   - `next` – Hit block (or next air block to check)
+
+**Usage Example:**
+
+```cpp
+// Ray cast from player's eyes
+glm::vec3 eye_pos = player.position + glm::vec3(0, player.eyelevel, 0);
+HitRay ray(&world, player.rotation, eye_pos);
+
+glm::ivec3 hit_block, previous_block;
+bool found = false;
+
+auto callback = [&](glm::ivec3 prev, glm::ivec3 hit) {
+    previous_block = prev;  // Last air block (for placement)
+    hit_block = hit;        // Block being looked at
+    found = true;
+};
+
+// Step up to 10 blocks away
+for (int i = 0; i < 200 && !found; i++) {
+    if (ray.step(callback)) break;
+}
+
+if (found) {
+    // Left click: break hit_block
+    // Right click: place block at previous_block
+}
+```
+
+## Collision System Integration
+
+The collision system integrates into the physics update at `entity.cpp:65-176`:
+
+```cpp
+// 1. Update entity's AABB
+update_collider();
+
+// 2. Search nearby blocks
+for (each nearby block) {
+    int block_id = world->get_block_number(block_pos);
+    if (!block_id) continue;
+    
+    // 3. Test against all block colliders
+    for (auto& block_collider : world->block_types[block_id]->colliders) {
+        Collider world_col = block_collider + block_pos;
+        
+        // 4. Swept collision test
+        auto [time, normal] = entity.collider.collide(world_col, velocity * dt);
+        
+        // 5. Track earliest collision
+        if (normal != glm::vec3(0) && time < earliest_time) {
+            earliest_collision = {time, normal};
+        }
+    }
+}
+
+// 6. Apply collision response
+if (earliest_collision.second != glm::vec3(0)) {
+    // Move to collision point
+    // Zero velocity on collision axis
+    // Set grounded flag if hit floor
+}
+```
+
+## Performance Notes
+
+- **Broad phase:** Entity physics only checks blocks within `±width/2` and `±height` of the entity
+- **Swept tests:** Continuous collision prevents tunneling through blocks even at high speeds
+- **Multiple passes:** 3 collision iterations resolve corner cases and multi-axis collisions
+- **Ray casting:** DDA traversal is efficient, typically checking only a few blocks per step
+
+## Block Colliders
+
+Blocks can have multiple colliders (defined in `BlockType`):
+
+```cpp
+// Full block (most common)
+std::vector<Collider> colliders = {
+    Collider(glm::vec3(0, 0, 0), glm::vec3(1, 1, 1))
+};
+
+// Slab (half height)
+std::vector<Collider> colliders = {
+    Collider(glm::vec3(0, 0, 0), glm::vec3(1, 0.5, 1))
+};
+
+// Non-solid (air, plants)
+std::vector<Collider> colliders = {};  // Empty
+```
+
+Each collider is in **local block space** (0 to 1), then translated to world space during collision checks.

@@ -1,0 +1,274 @@
+---
+title: Building from Source
+description: Step-by-step guide to compile MC-CPP using CMake on Windows, Linux, and macOS
+---
+
+MC-CPP uses CMake as its build system and includes all required dependencies in the source tree.
+
+## Prerequisites
+
+<Steps>
+  <Step title="Install a C++20 Compiler">
+    **Windows**: MinGW-w64 (GCC 10+) or MSVC 2019+
+    
+    **Linux**: GCC 10+ or Clang 11+
+    ```bash
+    sudo apt install build-essential cmake  # Debian/Ubuntu
+    sudo dnf install gcc-c++ cmake          # Fedora
+    ```
+    
+    **macOS**: Xcode Command Line Tools
+    ```bash
+    xcode-select --install
+    ```
+  </Step>
+
+  <Step title="Install CMake">
+    CMake 3.17 or higher is required.
+    
+    **Windows**: Download from [cmake.org](https://cmake.org/download/)
+    
+    **Linux**:
+    ```bash
+    sudo apt install cmake  # Debian/Ubuntu
+    ```
+    
+    **macOS**:
+    ```bash
+    brew install cmake
+    ```
+    
+    Verify installation:
+    ```bash
+    cmake --version
+    ```
+  </Step>
+
+  <Step title="Clone the Repository">
+    ```bash
+    git clone <repository-url>
+    cd MC-CPP
+    ```
+  </Step>
+</Steps>
+
+## Build Instructions
+
+<Tip>
+All dependencies (GLFW, GLAD, GLM, stb, zlib, miniaudio) are included in the `include/` directory - no external package manager needed!
+</Tip>
+
+<CodeGroup>
+
+```bash Windows (MinGW)
+# Use the provided compile script
+compile.bat
+
+# Or manually:
+cmake -G "MinGW Makefiles" -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel
+```
+
+```bash Linux
+# Use the provided compile script
+chmod +x compile.sh
+./compile.sh
+
+# Or manually:
+mkdir build && cd build
+cmake -DCMAKE_BUILD_TYPE=Release ..
+cmake --build . --config Release --parallel
+```
+
+```bash macOS
+# Same as Linux
+chmod +x compile.sh
+./compile.sh
+
+# Or manually:
+mkdir build && cd build
+cmake -DCMAKE_BUILD_TYPE=Release ..
+cmake --build . --config Release --parallel
+```
+
+</CodeGroup>
+
+## CMake Configuration Options
+
+The `CMakeLists.txt` (source:/home/daytona/workspace/source/CMakeLists.txt:1) configures the project with optimized defaults:
+
+### Build Type
+
+```cmake
+# Defaults to Release if not specified
+-DCMAKE_BUILD_TYPE=Release
+```
+
+### Compiler Optimizations
+
+The build system automatically applies platform-specific optimizations:
+
+**MSVC (Windows)**:
+- `/O2` - Maximum optimization
+- `/LTCG` - Link-time code generation
+- `/permissive-` - Standards conformance
+
+**GCC/Clang (Linux/macOS)**:
+- `-O3` - Aggressive optimization
+- `-march=native -mtune=native` - CPU-specific tuning
+- `-flto=6` - Link-time optimization with 6 parallel jobs
+
+<Note>
+Interprocessural optimization (IPO/LTO) is enabled by default via `CMAKE_INTERPROCEDURAL_OPTIMIZATION=ON` for maximum performance.
+</Note>
+
+### C++ Standard
+
+The project requires C++20:
+
+```cmake
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+```
+
+## Build Targets
+
+The build system creates multiple executables:
+
+### Main Game
+
+```bash
+# Executable: MC-CPP (or MC-CPP.exe on Windows)
+cd build
+./MC-CPP
+```
+
+### Unit Tests
+
+```bash
+# Test executable with headless mode
+./mc_tests
+```
+
+Defined in CMakeLists.txt (source:/home/daytona/workspace/source/CMakeLists.txt:64) with the `UNIT_TEST` preprocessor definition.
+
+### Performance Benchmarks
+
+```bash
+# Benchmark hotspots
+./mc_bench
+```
+
+Defined in CMakeLists.txt (source:/home/daytona/workspace/source/CMakeLists.txt:68) for profiling critical code paths.
+
+## Asset Copying
+
+CMake automatically copies required assets to the build directory:
+
+```cmake
+file(COPY ${CMAKE_SOURCE_DIR}/assets DESTINATION ${CMAKE_BINARY_DIR})
+file(COPY ${CMAKE_SOURCE_DIR}/data DESTINATION ${CMAKE_BINARY_DIR})
+file(COPY ${CMAKE_SOURCE_DIR}/save DESTINATION ${CMAKE_BINARY_DIR})
+```
+
+This ensures:
+- **assets/** - Shaders, textures, fonts, audio files
+- **data/** - Block definitions (`blocks.mccpp`)
+- **save/** - World save directory
+
+are available when running the executable from the build directory.
+
+## Platform-Specific Libraries
+
+The build system links appropriate OpenGL and windowing libraries:
+
+<CodeGroup>
+
+```cmake Windows
+target_link_libraries(${PROJECT_NAME} PRIVATE 
+  glfw glad zlib opengl32 gdi32
+)
+```
+
+```cmake macOS
+target_link_libraries(${PROJECT_NAME} PRIVATE 
+  glfw glad zlib
+  "-framework OpenGL"
+  "-framework Cocoa" 
+  "-framework IOKit"
+  "-framework CoreFoundation"
+)
+```
+
+```cmake Linux
+target_link_libraries(${PROJECT_NAME} PRIVATE 
+  glfw glad zlib GL X11 pthread dl
+)
+```
+
+</CodeGroup>
+
+## Incremental vs Clean Builds
+
+### Incremental Build (Faster)
+
+The Windows compile script (`compile.bat`) performs incremental builds by default:
+
+```batch
+# CMake detects existing build/ and only rebuilds changed files
+cmake -G "MinGW Makefiles" -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel
+```
+
+### Clean Build (From Scratch)
+
+The Linux/macOS script (`compile.sh`) performs clean builds:
+
+```bash
+rm -rf build
+mkdir build && cd build
+cmake -DCMAKE_BUILD_TYPE=Release ..
+cmake --build . --config Release --parallel
+```
+
+<Warning>
+Clean builds take longer but ensure no stale build artifacts. Use them when switching between Debug/Release or after major code changes.
+</Warning>
+
+## Troubleshooting
+
+### Compiler Not Found
+
+If CMake can't find your compiler:
+
+```bash
+# Specify compiler explicitly
+cmake -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ -S . -B build
+```
+
+### Missing OpenGL Headers
+
+**Linux**: Install OpenGL development libraries
+```bash
+sudo apt install libgl1-mesa-dev libglu1-mesa-dev  # Debian/Ubuntu
+sudo dnf install mesa-libGL-devel                   # Fedora
+```
+
+### Build Fails with Link Errors
+
+On Linux, if you see `lseek` errors from zlib:
+
+```bash
+# The CMakeLists.txt already handles this with:
+add_compile_definitions(Z_HAVE_UNISTD_H)
+add_compile_definitions(_GNU_SOURCE)
+```
+
+If issues persist, ensure you're using a recent CMake version:
+```bash
+cmake --version  # Should be 3.17+
+```
+
+## Next Steps
+
+Once the build completes successfully, proceed to the [Quickstart Guide](/quickstart) to run the game and learn the controls.

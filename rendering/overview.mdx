@@ -1,0 +1,148 @@
+---
+title: "Rendering Pipeline Overview"
+description: "High-level overview of MC-CPP's OpenGL rendering pipeline, including chunk meshing, lighting, and shadow mapping"
+---
+
+MC-CPP implements a modern OpenGL 3.3 rendering pipeline designed for efficient voxel world rendering with advanced lighting features.
+
+## Architecture
+
+The rendering system is organized around these core components:
+
+- **World** (`src/world.h/cpp`) - Owns shaders, texture manager, and manages the rendering pipeline
+- **Chunk/Subchunk** - Builds optimized meshes with packed vertex data
+- **Shader System** - Minimal GL shader wrapper for program management
+- **Texture Manager** - Handles texture array atlas for all block textures
+- **Shadow System** - Cascaded shadow mapping (CSM) for directional shadows
+
+## Render Loop
+
+The main render loop in `src/main.cpp` follows this order:
+
+```cpp
+// 1. Update player and world state
+player.update(dt);
+world.tick(dt);
+
+// 2. Setup camera matrices
+shader.use();
+player.update_matrices(1.0f);
+
+// 3. Prepare visible chunks (distance sort)
+world.prepare_rendering();
+
+// 4. Shadow pass (fills depth array for each cascade)
+world.render_shadows();
+
+// 5. Main rendering pass
+post_processor->beginRender();
+shader.use();
+glActiveTexture(GL_TEXTURE0);
+glBindTexture(GL_TEXTURE_2D_ARRAY, tm.texture_array);
+world.draw();
+
+// 6. UI and post-processing
+post_processor->endRender();
+// ... crosshair, debug text, swap buffers
+```
+
+## Chunk Meshing
+
+Chunks (16×128×16) are subdivided into subchunks (16×16×16) for efficient updates:
+
+- **Face culling**: Only visible block faces are meshed
+- **Greedy meshing**: Not implemented, uses per-face quads
+- **Separate buffers**: Opaque and translucent geometry use different VBOs
+- **Packed vertices**: All data (position, UV, lighting) packed into 3× `uint32_t` per vertex
+
+### Vertex Data Format
+
+Each vertex is packed into three 32-bit integers:
+
+```cpp
+// a_Data0: packed position X (int16), Y (int16)
+// a_Data1: packed position Z (int16), UV u (uint8), UV v (uint8)
+// a_Data2: texture layer (uint8), shading (uint8), blocklight (4-bit), skylight (4-bit)
+```
+
+This compact format minimizes memory bandwidth and allows efficient GPU upload.
+
+## Lighting Model
+
+MC-CPP uses a **colored lighting system** with two light sources:
+
+### Block Light (Artificial)
+- Orange/warm tint: `vec3(1.10, 0.85, 0.65)`
+- Emitted by torches, lava, glowstone, etc.
+- 16 light levels, propagated using flood-fill queues
+
+### Sky Light (Natural)
+- Day tint: `vec3(0.85, 0.95, 1.05)` (cool blue-white)
+- Night tint: `vec3(0.25, 0.35, 0.55)` (deep blue)
+- Blended based on day/night cycle
+- Propagates downward with no decay, horizontally with decay
+
+Both lights combine additively in the vertex shader (`colored_lighting/vert.glsl:56`):
+
+```glsl
+vec3 light = blockTint * blockIntensity + skyTint * skyIntensity;
+```
+
+### Smooth Lighting
+
+When `Options::SMOOTH_LIGHTING` is enabled:
+
+- Per-vertex lighting interpolates light from neighboring blocks
+- Ambient occlusion computed from 8 neighboring voxels per face
+- Results in softer shadows at block edges
+
+See `src/chunk/subchunk.cpp:75-150` for AO and smooth lighting implementation.
+
+## Rendering Passes
+
+### 1. Shadow Pass
+
+Renders depth-only to shadow map array (one layer per cascade):
+- Uses `shadow_shader` with simplified vertex transformation
+- Alpha-tested for foliage/transparent blocks
+- Outputs to `GL_TEXTURE_2D_ARRAY` with `GL_DEPTH_COMPONENT24`
+
+### 2. Opaque Pass
+
+Renders solid blocks front-to-back (chunks sorted by distance):
+- Samples block texture array on `GL_TEXTURE0`
+- Samples shadow map array on `GL_TEXTURE1`
+- Applies colored lighting and shadow factor
+
+### 3. Translucent Pass
+
+Renders transparent blocks (water, glass, leaves) back-to-front:
+- Same shader as opaque pass
+- `glDepthMask(GL_FALSE)` for correct blending
+- Alpha blending enabled
+
+## Performance Considerations
+
+- **Chunk updates**: Limited to `Options::CHUNK_UPDATES` per frame (default: 4)
+- **Light propagation**: Limited to `Options::LIGHT_STEPS_PER_TICK` steps (default: 2048)
+- **Distance sorting**: Visible chunks sorted by squared distance for minimal overhead
+- **Index buffer sharing**: Single IBO shared by all chunks
+- **Texture atlas**: Single texture array eliminates texture binding overhead
+
+## GL State Management
+
+Critical invariants to maintain:
+
+1. **Texture unit 0** must always hold the block texture array during main rendering
+2. **Texture unit 1** holds the shadow map (when shadows enabled)
+3. Shadow pass must restore `glDrawBuffer`, `glReadBuffer`, and viewport
+4. Main world shader must be bound before `player.update_matrices()`
+
+See `src/world.cpp:573-673` for the complete render implementation.
+
+## Related Pages
+
+- [Shader System](/rendering/shaders) - Shader loading and uniform management
+- [Texture Management](/rendering/textures) - Texture atlas and loading
+- [Lighting System](/rendering/lighting) - Colored lighting details
+- [Shadow Mapping](/rendering/shadows) - CSM implementation

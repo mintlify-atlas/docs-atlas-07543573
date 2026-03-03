@@ -1,0 +1,284 @@
+---
+title: "TextureManager"
+description: "Manages a texture array atlas for block textures with automatic loading and indexing"
+---
+
+## Overview
+
+The `TextureManager` class creates and manages an OpenGL 2D texture array that serves as a texture atlas for block rendering. It handles loading PNG images using stb_image, uploading them to GPU texture layers, and providing texture indices for shader sampling.
+
+**Header:** `src/renderer/texture_manager.h`
+
+## Constructor
+
+### TextureManager
+
+```cpp
+TextureManager(int w, int h, int max_tex)
+```
+
+Creates a new texture manager and initializes an OpenGL 2D texture array.
+
+**Parameters:**
+- `w` - Width of each texture in pixels
+- `h` - Height of each texture in pixels
+- `max_tex` - Maximum number of textures the array can hold
+
+**Behavior:**
+- Creates a `GL_TEXTURE_2D_ARRAY` texture object
+- Sets texture filtering based on `Options::MIPMAP_TYPE` (min filter) and `GL_NEAREST` (mag filter)
+- Enables vertical flip for loaded images via `stbi_set_flip_vertically_on_load(true)`
+- Allocates GPU storage with `glTexImage3D` (empty, filled later by `add_texture`)
+- **Important:** Always binds `texture_array` before texture operations to avoid writing to wrong GL objects
+
+**Example:**
+```cpp
+TextureManager tm(16, 16, 256); // 16x16 textures, max 256 layers
+tm.add_texture("dirt");
+tm.add_texture("grass_top");
+tm.generate_mipmaps();
+```
+
+## Public Members
+
+### texture_width
+
+```cpp
+int texture_width
+```
+
+Width of each texture in the array (in pixels).
+
+### texture_height
+
+```cpp
+int texture_height
+```
+
+Height of each texture in the array (in pixels).
+
+### max_textures
+
+```cpp
+int max_textures
+```
+
+Maximum number of texture layers the array can hold.
+
+### textures
+
+```cpp
+std::vector<std::string> textures
+```
+
+Ordered list of texture names that have been added. The index in this vector corresponds to the texture layer in the array.
+
+### texture_array
+
+```cpp
+GLuint texture_array
+```
+
+OpenGL texture object ID for the `GL_TEXTURE_2D_ARRAY`. Used in shader bindings.
+
+## Methods
+
+### add_texture
+
+```cpp
+void add_texture(std::string texture)
+```
+
+Loads a texture from disk and uploads it to the next available layer in the texture array.
+
+**Parameters:**
+- `texture` - Texture name (without path or extension)
+
+**Behavior:**
+- Skips if texture with the same name already exists
+- Loads image from `assets/textures/{texture}.png` using stb_image with 4 channels (RGBA)
+- Binds `texture_array` before upload (critical for shadow map compatibility)
+- Uploads pixel data to layer index = `textures.size() - 1` using `glTexSubImage3D`
+- Frees loaded image data with `stbi_image_free`
+- Outputs success/failure message to console
+
+**Example:**
+```cpp
+tm.add_texture("stone");     // Loads assets/textures/stone.png → layer 0
+tm.add_texture("dirt");      // Loads assets/textures/dirt.png → layer 1
+tm.add_texture("grass_top"); // Loads assets/textures/grass_top.png → layer 2
+```
+
+**Console Output:**
+```
+Loading texture assets/textures/stone.png (16x16, channels=4) into layer 0
+Loading texture assets/textures/dirt.png (16x16, channels=3) into layer 1
+Failed load tex: assets/textures/missing.png
+```
+
+### generate_mipmaps
+
+```cpp
+void generate_mipmaps()
+```
+
+Generates mipmaps for the entire texture array.
+
+**Behavior:**
+- Binds `texture_array` before generation
+- Calls `glGenerateMipmap(GL_TEXTURE_2D_ARRAY)`
+- Should be called after all textures are added
+
+**Example:**
+```cpp
+// Load all textures
+tm.add_texture("stone");
+tm.add_texture("dirt");
+tm.add_texture("grass_top");
+
+// Generate mipmaps once
+tm.generate_mipmaps();
+```
+
+### get_texture_index
+
+```cpp
+int get_texture_index(std::string texture)
+```
+
+Retrieves the layer index for a previously added texture.
+
+**Parameters:**
+- `texture` - Texture name to look up
+
+**Returns:** 
+- Layer index (0-based) if texture exists
+- 0 if texture not found (defaults to first texture)
+
+**Example:**
+```cpp
+int stone_layer = tm.get_texture_index("stone"); // Returns 0 if loaded first
+int dirt_layer = tm.get_texture_index("dirt");   // Returns 1 if loaded second
+int missing = tm.get_texture_index("unknown");   // Returns 0 (fallback)
+```
+
+## Implementation Details
+
+### OpenGL Texture Array Setup
+
+```cpp
+// Constructor creates and configures texture array
+glGenTextures(1, &texture_array);
+glBindTexture(GL_TEXTURE_2D_ARRAY, texture_array);
+
+// Set filtering
+glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, Options::MIPMAP_TYPE);
+glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+
+// Allocate storage
+glTexImage3D(GL_TEXTURE_2D_ARRAY, 
+             0,                    // mipmap level
+             GL_RGBA,              // internal format
+             texture_width,        // width
+             texture_height,       // height
+             max_textures,         // depth (layers)
+             0,                    // border (must be 0)
+             GL_RGBA,              // format
+             GL_UNSIGNED_BYTE,     // type
+             NULL);                // data (null = allocate only)
+```
+
+### Texture Loading and Upload
+
+```cpp
+// add_texture implementation
+std::string path = "assets/textures/" + texture + ".png";
+int width, height, nrChannels;
+unsigned char *data = stbi_load(path.c_str(), &width, &height, &nrChannels, 4);
+
+if (data) {
+    glBindTexture(GL_TEXTURE_2D_ARRAY, texture_array); // Critical!
+    glTexSubImage3D(GL_TEXTURE_2D_ARRAY,
+                    0,              // mipmap level
+                    0, 0,           // x, y offset
+                    index,          // layer index
+                    width, height,  // dimensions
+                    1,              // depth (1 layer)
+                    GL_RGBA,        // format
+                    GL_UNSIGNED_BYTE,
+                    data);
+    stbi_image_free(data);
+}
+```
+
+### Shadow Map Compatibility
+
+**Critical:** The TextureManager must always bind `texture_array` before calling `glTexSubImage3D` or `glGenerateMipmap`. This prevents accidentally uploading block textures into the shadow map when shadows are enabled.
+
+```cpp
+// CORRECT - always bind before upload
+glBindTexture(GL_TEXTURE_2D_ARRAY, texture_array);
+glTexSubImage3D(GL_TEXTURE_2D_ARRAY, ...);
+
+// WRONG - uses whatever was last bound (might be shadow_map!)
+glTexSubImage3D(GL_TEXTURE_2D_ARRAY, ...);
+```
+
+See `src/renderer/texture_manager.cpp:43` and `src/renderer/texture_manager.cpp:26` for explicit bindings.
+
+### Unit Test Mode
+
+When `UNIT_TEST` is defined:
+- Constructor sets `texture_array = 0` and skips GL calls
+- `generate_mipmaps` and texture upload code paths are skipped
+- Allows testing texture index logic without OpenGL context
+
+## Usage Pattern
+
+```cpp
+// 1. Initialize with texture dimensions and capacity
+TextureManager tm(16, 16, 256);
+
+// 2. Load all textures (order matters - determines layer indices)
+tm.add_texture("stone");
+tm.add_texture("dirt");
+tm.add_texture("grass_top");
+tm.add_texture("grass_side");
+tm.add_texture("water");
+// ... add more textures ...
+
+// 3. Generate mipmaps after all textures loaded
+tm.generate_mipmaps();
+
+// 4. Get indices for block definitions
+int stone_idx = tm.get_texture_index("stone");      // 0
+int dirt_idx = tm.get_texture_index("dirt");        // 1
+int grass_top_idx = tm.get_texture_index("grass_top"); // 2
+
+// 5. Bind in render loop
+glActiveTexture(GL_TEXTURE0);
+glBindTexture(GL_TEXTURE_2D_ARRAY, tm.texture_array);
+// ... shader samples from u_TextureArraySampler = 0 ...
+```
+
+## Integration with Shaders
+
+Texture array is sampled in shaders using:
+
+```glsl
+// Vertex/fragment shader
+uniform sampler2DArray u_TextureArraySampler;
+
+// v_TexCoords.xy = UV coordinates (0-1)
+// v_TexCoords.z = texture layer index
+vec4 color = texture(u_TextureArraySampler, v_TexCoords);
+```
+
+The layer index comes from block type definitions which store indices obtained via `get_texture_index`.
+
+## See Also
+
+- [Shader](/api/shader) - Used to bind texture array to shader samplers
+- Block type definitions in `src/renderer/block_type.h`
+- Texture loading from `data/blocks.mccpp`
+- `World::draw()` - Binds texture array before rendering (src/world.cpp)

@@ -1,0 +1,307 @@
+---
+title: "Shader"
+description: "OpenGL shader program wrapper for loading, compiling, and managing GLSL shaders"
+---
+
+## Overview
+
+The `Shader` class provides a high-level interface for working with OpenGL shader programs. It handles loading shader source files, compiling vertex and fragment shaders, linking programs, and setting uniform variables.
+
+**Header:** `src/renderer/shader.h`
+
+## Constructor
+
+### Shader
+
+```cpp
+Shader(const char* vertexPath, const char* fragmentPath)
+```
+
+Creates a new shader program by loading, compiling, and linking vertex and fragment shaders.
+
+**Parameters:**
+- `vertexPath` - File path to the vertex shader source (.glsl)
+- `fragmentPath` - File path to the fragment shader source (.glsl)
+
+**Behavior:**
+- Reads shader source files from disk
+- Compiles vertex and fragment shaders
+- Links shaders into a program
+- Sets `ID` to 0 if compilation or linking fails
+- Outputs compilation/linking errors to console
+- Automatically cleans up shader objects after linking
+
+**Example:**
+```cpp
+Shader shader("assets/shaders/colored_lighting/vert.glsl", 
+              "assets/shaders/colored_lighting/frag.glsl");
+if (!shader.valid()) {
+    // Handle shader creation failure
+}
+```
+
+## Destructor
+
+### ~Shader
+
+```cpp
+~Shader()
+```
+
+Cleans up the OpenGL shader program by calling `glDeleteProgram` if the shader is valid.
+
+## Public Members
+
+### ID
+
+```cpp
+unsigned int ID
+```
+
+The OpenGL program ID. Set to 0 if shader compilation or linking failed.
+
+## Methods
+
+### valid
+
+```cpp
+bool valid() const
+```
+
+Checks whether the shader program was successfully compiled and linked.
+
+**Returns:** `true` if the shader is valid (ID != 0), `false` otherwise
+
+### use
+
+```cpp
+void use()
+```
+
+Activates this shader program for rendering by calling `glUseProgram`.
+
+**Example:**
+```cpp
+shader.use();
+// Set uniforms and draw calls here
+```
+
+### find_uniform
+
+```cpp
+int find_uniform(const std::string& name)
+```
+
+Retrieves the location of a uniform variable in the shader program.
+
+**Parameters:**
+- `name` - Name of the uniform variable
+
+**Returns:** Uniform location (>= 0 if found, -1 if not found)
+
+**Example:**
+```cpp
+int mvp_loc = shader.find_uniform("u_MVPMatrix");
+if (mvp_loc >= 0) {
+    shader.setMat4(mvp_loc, mvpMatrix);
+}
+```
+
+### setMat4
+
+```cpp
+void setMat4(int location, const glm::mat4& mat) const
+```
+
+Sets a 4x4 matrix uniform value.
+
+**Parameters:**
+- `location` - Uniform location (from `find_uniform`)
+- `mat` - GLM mat4 matrix to set
+
+**Example:**
+```cpp
+int mvp_loc = shader.find_uniform("u_MVPMatrix");
+shader.setMat4(mvp_loc, projectionMatrix * viewMatrix * modelMatrix);
+```
+
+### setInt
+
+```cpp
+void setInt(int location, int value) const
+```
+
+Sets an integer uniform value.
+
+**Parameters:**
+- `location` - Uniform location
+- `value` - Integer value to set
+
+**Example:**
+```cpp
+int sampler_loc = shader.find_uniform("u_TextureArraySampler");
+shader.setInt(sampler_loc, 0); // Bind to texture unit 0
+```
+
+### setFloat
+
+```cpp
+void setFloat(int location, float value) const
+```
+
+Sets a float uniform value.
+
+**Parameters:**
+- `location` - Uniform location
+- `value` - Float value to set
+
+### setVec2i
+
+```cpp
+void setVec2i(int location, int x, int y) const
+```
+
+Sets a 2D integer vector uniform value.
+
+**Parameters:**
+- `location` - Uniform location
+- `x` - X component
+- `y` - Y component
+
+### setVec2
+
+```cpp
+void setVec2(int location, const glm::vec2& value) const
+```
+
+Sets a 2D float vector uniform value.
+
+**Parameters:**
+- `location` - Uniform location
+- `value` - GLM vec2 to set
+
+### setVec3
+
+```cpp
+void setVec3(int location, const glm::vec3& value) const
+```
+
+Sets a 3D float vector uniform value.
+
+**Parameters:**
+- `location` - Uniform location
+- `value` - GLM vec3 to set
+
+**Example:**
+```cpp
+int light_dir_loc = shader.find_uniform("u_LightDirection");
+shader.setVec3(light_dir_loc, glm::vec3(0.5f, -1.0f, 0.3f));
+```
+
+### setMat4Array
+
+```cpp
+void setMat4Array(int location, const std::vector<glm::mat4>& mats) const
+```
+
+Sets an array of 4x4 matrices as a uniform value.
+
+**Parameters:**
+- `location` - Uniform location
+- `mats` - Vector of GLM mat4 matrices
+
+**Behavior:**
+- Returns early if location is invalid (< 0) or vector is empty
+- Uploads all matrices in the vector to the shader
+
+**Example:**
+```cpp
+std::vector<glm::mat4> shadowMatrices = {cascade1, cascade2, cascade3, cascade4};
+int shadow_loc = shader.find_uniform("u_LightSpaceMatrices");
+shader.setMat4Array(shadow_loc, shadowMatrices);
+```
+
+### setFloatArray
+
+```cpp
+void setFloatArray(int location, const std::vector<float>& values) const
+```
+
+Sets an array of floats as a uniform value.
+
+**Parameters:**
+- `location` - Uniform location
+- `values` - Vector of float values
+
+**Behavior:**
+- Returns early if location is invalid (< 0) or vector is empty
+- Uploads all values in the vector to the shader
+
+**Example:**
+```cpp
+std::vector<float> cascadeSplits = {10.0f, 50.0f, 150.0f, 500.0f};
+int splits_loc = shader.find_uniform("u_CascadeSplits");
+shader.setFloatArray(splits_loc, cascadeSplits);
+```
+
+## Implementation Details
+
+### Error Handling
+
+The shader class performs comprehensive error checking:
+
+- **File reading errors**: Catches `std::ifstream::failure` exceptions and sets ID to 0
+- **Compilation errors**: Checks `GL_COMPILE_STATUS` and outputs shader info log
+- **Linking errors**: Checks `GL_LINK_STATUS` and outputs program info log
+
+All errors are printed to `std::cout` with descriptive messages.
+
+### OpenGL Integration
+
+```cpp
+// Internal compilation flow (constructor)
+GLuint vertex = glCreateShader(GL_VERTEX_SHADER);
+glShaderSource(vertex, 1, &vShaderCode, NULL);
+glCompileShader(vertex);
+// ... check compilation ...
+
+GLuint fragment = glCreateShader(GL_FRAGMENT_SHADER);
+glShaderSource(fragment, 1, &fShaderCode, NULL);
+glCompileShader(fragment);
+// ... check compilation ...
+
+ID = glCreateProgram();
+glAttachShader(ID, vertex);
+glAttachShader(ID, fragment);
+glLinkProgram(ID);
+// ... check linking ...
+
+glDeleteShader(vertex);
+glDeleteShader(fragment);
+```
+
+### Usage Pattern
+
+```cpp
+// 1. Create shader
+Shader shader("vertex.glsl", "fragment.glsl");
+if (!shader.valid()) return;
+
+// 2. Cache uniform locations
+int mvp_loc = shader.find_uniform("u_MVPMatrix");
+int sampler_loc = shader.find_uniform("u_TextureArraySampler");
+int daylight_loc = shader.find_uniform("u_Daylight");
+
+// 3. In render loop
+shader.use();
+shader.setMat4(mvp_loc, camera.getVPMatrix());
+shader.setInt(sampler_loc, 0);
+shader.setFloat(daylight_loc, world.getDaylightFactor());
+// ... draw calls ...
+```
+
+## See Also
+
+- [TextureManager](/api/texture-manager) - Manages texture arrays used with shaders
+- Shader source files in `assets/shaders/`
+- `World::draw()` - Main shader usage example in src/world.cpp

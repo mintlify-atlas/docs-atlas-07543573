@@ -1,0 +1,399 @@
+---
+title: Physics System
+description: Entity physics integration with gravity, drag, friction, velocity, and movement mechanics
+---
+
+## Overview
+
+The physics system handles gravity, movement, friction, drag, and collision resolution for all entities in MC-CPP. The core implementation is in the `Entity` class.
+
+**Location:** `src/entity/entity.h`, `src/entity/entity.cpp`
+
+## Entity Class
+
+```cpp
+class Entity {
+public:
+    World* world;
+    glm::vec3 position;
+    glm::vec3 old_position;      // For interpolation
+    glm::vec2 rotation;
+    glm::vec3 velocity;
+    glm::vec3 accel;
+    Collider collider;
+
+    float width = 0.6f;
+    float height = 1.8f;
+    bool grounded = false;
+    bool flying = false;
+
+    float step_offset = 0.0f;    // For smooth stair climbing
+
+    Entity(World* w);
+    virtual void update(float dt);
+    void update_collider();
+    void jump();
+};
+```
+
+## Physics Constants
+
+All constants are defined at `entity.cpp:8-23`:
+
+```cpp
+// Gravity acceleration (blocks/second²)
+const glm::vec3 GRAVITY_ACCEL(0.0f, -32.0f, 0.0f);
+const glm::vec3 FLYING_ACCEL(0.0f, 0.0f, 0.0f);  // No gravity when flying
+
+// Ground friction (when grounded)
+const glm::vec3 FRICTION(20.0f, 20.0f, 20.0f);
+
+// Drag when flying
+const glm::vec3 DRAG_FLY(5.0f, 5.0f, 5.0f);
+
+// Drag when jumping (upward)
+const glm::vec3 DRAG_JUMP(1.8f, 0.0f, 1.8f);
+
+// Drag when falling (downward)
+const glm::vec3 DRAG_FALL(1.8f, 0.4f, 1.8f);
+```
+
+**Key Values:**
+- Gravity: `-32 blocks/s²` on Y axis (standard Minecraft)
+- Ground friction: High (`20`) for quick stopping
+- Air resistance varies by movement state
+
+## Entity Dimensions
+
+Default size at `entity.h:17-18`:
+
+```cpp
+float width = 0.6f;   // 0.6 blocks wide (X/Z)
+float height = 1.8f;  // 1.8 blocks tall (Y)
+```
+
+These match Minecraft's player hitbox dimensions.
+
+## Jumping Mechanics
+
+Implementation at `entity.cpp:31-37`:
+
+```cpp
+void Entity::jump() {
+    if(grounded) {
+        float jump_height = 1.25f;
+        velocity.y = sqrt(2 * jump_height * 32.0f);
+    }
+}
+```
+
+**Formula:**
+- Uses kinematic equation: `v = sqrt(2 * h * g)`
+- Jump height: `1.25 blocks`
+- Initial jump velocity: `sqrt(2 * 1.25 * 32) ≈ 8 blocks/s`
+- Only works when `grounded == true`
+
+## Friction Selection
+
+Helper function at `entity.cpp:40-45` chooses friction based on state:
+
+```cpp
+glm::vec3 get_friction_vector(bool flying, bool grounded, float vel_y) {
+    if (flying) return DRAG_FLY;
+    if (grounded) return FRICTION;
+    if (vel_y > 0) return DRAG_JUMP;  // Going up
+    return DRAG_FALL;                  // Falling down
+}
+```
+
+**Logic:**
+1. Flying → constant drag in all directions
+2. Grounded → high friction to stop movement
+3. Airborne & rising → horizontal drag, no vertical drag
+4. Airborne & falling → horizontal drag + slight vertical drag
+
+## Physics Update Loop
+
+The `update()` method at `entity.cpp:47-208` runs every frame:
+
+### 1. Save Previous Position
+
+```cpp
+old_position = position;
+```
+
+Used for rendering interpolation between ticks.
+
+### 2. Step Offset Smoothing
+
+At `entity.cpp:51-56`, smoothly lowers camera after climbing stairs:
+
+```cpp
+if (step_offset < 0.0f) {
+    step_offset += dt * 8.0f;  // Rise camera at 8 blocks/s
+    if (step_offset > 0.0f) step_offset = 0.0f;
+}
+```
+
+### 3. Apply Input Acceleration
+
+At `entity.cpp:59-62`:
+
+```cpp
+glm::vec3 f_vec = get_friction_vector(flying, grounded, velocity.y);
+velocity += accel * f_vec * dt;
+accel = glm::vec3(0);  // Reset acceleration after applying
+```
+
+- Multiplies acceleration by friction/drag before applying
+- Resets `accel` so it must be set each frame by input code
+
+### 4. Collision Resolution
+
+At `entity.cpp:65-176`, performs 3 passes of collision detection:
+
+```cpp
+update_collider();
+grounded = false;
+
+for(int i=0; i<3; i++) {
+    glm::vec3 adj_vel = velocity * dt;
+    
+    // Broad-phase: find blocks to check
+    int step_x = (adj_vel.x > 0) ? 1 : -1;
+    int step_y = (adj_vel.y > 0) ? 1 : -1;
+    int step_z = (adj_vel.z > 0) ? 1 : -1;
+    
+    // Search area around entity
+    int steps_xz = (int)(width/2);
+    int steps_y = (int)height;
+    
+    // Find earliest collision
+    std::pair<float, glm::vec3> collision = {1.0f, glm::vec3(0)};
+    
+    // Check all nearby blocks...
+    for(int bx = ...) {
+        for(int by = ...) {
+            for(int bz = ...) {
+                int num = world->get_block_number({bx, by, bz});
+                if(!num) continue;
+                
+                // Test against all block colliders
+                for(auto& col_offset : world->block_types[num]->colliders) {
+                    auto res = collider.collide(col_offset + glm::vec3(bx, by, bz), adj_vel);
+                    if(res.second != glm::vec3(0) && res.first < collision.first) {
+                        collision = res;
+                    }
+                }
+            }
+        }
+    }
+    
+    // Apply collision response
+    float entry = collision.first;
+    glm::vec3 normal = collision.second;
+    
+    if (entry < 1.0f) {
+        entry -= 0.001f;  // Small epsilon to prevent sticking
+        if (entry < 0) entry = 0;
+    }
+    
+    // Stop velocity on collision axes
+    if (normal.x != 0) {
+        position.x += adj_vel.x * entry;
+        velocity.x = 0;
+    }
+    if (normal.y != 0) {
+        position.y += adj_vel.y * entry;
+        velocity.y = 0;
+    }
+    if (normal.z != 0) {
+        position.z += adj_vel.z * entry;
+        velocity.z = 0;
+    }
+    
+    if (normal.y == 1) grounded = true;  // Hit floor
+}
+```
+
+**Collision Algorithm:**
+- Runs 3 iterations to resolve multi-axis collisions
+- Finds earliest collision time using swept AABB (see [Collision Detection](/entities/collision))
+- Moves entity to collision point minus small epsilon
+- Sets `grounded = true` when hitting upward-facing surface (`normal.y == 1`)
+- Zeros velocity on collision axes
+
+### 5. Step Assist (Stair Climbing)
+
+At `entity.cpp:121-159`, allows stepping up blocks smoothly:
+
+```cpp
+bool horizontal_collision = (normal.x != 0 || normal.z != 0);
+if (grounded && horizontal_collision && !flying) {
+    float step_height = 0.6f;  // Can step up 0.6 blocks
+    Collider step_collider = collider + glm::vec3(adj_vel.x, step_height, adj_vel.z);
+    
+    // Check if space above is free
+    bool blocked = false;
+    for(int bx = x - 1; bx <= x + 1; bx++) {
+        for(int by = y; by <= y + 2; by++) {
+            for(int bz = z - 1; bz <= z + 1; bz++) {
+                // Test if step position collides...
+            }
+        }
+    }
+    
+    if (!blocked) {
+        position.y += step_height;
+        step_offset -= step_height;  // Camera smoothing
+        old_position.y += step_height;  // Prevent interpolation jitter
+        update_collider();
+        entry = 1.0f;  // Cancel collision
+        normal = glm::vec3(0);
+    }
+}
+```
+
+**Step Assist Features:**
+- Only active when grounded and hitting horizontal obstacle
+- Maximum step height: `0.6 blocks`
+- Checks if stepped-up position is free of collisions
+- Uses `step_offset` to smoothly animate camera rising
+- Updates `old_position` to avoid interpolation artifacts
+
+### 6. Apply Remaining Velocity
+
+At `entity.cpp:182`:
+
+```cpp
+position += velocity * dt;
+```
+
+Moves entity by remaining velocity (which may be zeroed on collision axes).
+
+### 7. Apply Gravity
+
+At `entity.cpp:186-187`:
+
+```cpp
+glm::vec3 gravity = flying ? FLYING_ACCEL : GRAVITY_ACCEL;
+velocity += gravity * dt;
+```
+
+- Normal mode: `-32 blocks/s²` vertical acceleration
+- Flying mode: No gravity
+
+### 8. Apply Velocity Decay
+
+At `entity.cpp:190-205`, applies friction/drag to slow down:
+
+```cpp
+f_vec = get_friction_vector(flying, grounded, velocity.y);
+
+auto apply_decay = [&](float& v, float f, float dt) {
+    float decay = v * f * dt;
+    // Clamp decay to prevent overshooting zero
+    if (std::abs(decay) > std::abs(v)) {
+        v = 0;
+    } else {
+        v -= decay;
+    }
+};
+
+apply_decay(velocity.x, f_vec.x, dt);
+apply_decay(velocity.y, f_vec.y, dt);
+apply_decay(velocity.z, f_vec.z, dt);
+```
+
+- Exponential decay proportional to current velocity
+- Prevents velocity from oscillating around zero
+
+### 9. Update Collider
+
+At `entity.cpp:207`:
+
+```cpp
+update_collider();
+```
+
+Final collider update for next frame.
+
+## Collider Update
+
+At `entity.cpp:27-29`:
+
+```cpp
+void Entity::update_collider() {
+    collider = Collider(position - glm::vec3(width/2, 0, width/2), 
+                        position + glm::vec3(width/2, height, width/2));
+}
+```
+
+**Bounding Box:**
+- Centered on X/Z axes around `position`
+- Bottom at `position.y`, top at `position.y + height`
+- Forms AABB for collision detection
+
+## Physics Flow Summary
+
+```
+┌─────────────────────────────┐
+│  1. Save old_position       │
+└──────────┬──────────────────┘
+           │
+┌──────────▼──────────────────┐
+│  2. Apply input acceleration│
+│     (velocity += accel * f) │
+└──────────┬──────────────────┘
+           │
+┌──────────▼──────────────────┐
+│  3. Collision detection     │
+│     (3 iterations, AABB)    │
+│  4. Step assist check       │
+└──────────┬──────────────────┘
+           │
+┌──────────▼──────────────────┐
+│  5. Apply remaining velocity│
+└──────────┬──────────────────┘
+           │
+┌──────────▼──────────────────┐
+│  6. Apply gravity           │
+└──────────┬──────────────────┘
+           │
+┌──────────▼──────────────────┐
+│  7. Apply friction/drag     │
+│     (velocity decay)        │
+└──────────┬──────────────────┘
+           │
+┌──────────▼──────────────────┐
+│  8. Update collider         │
+└─────────────────────────────┘
+```
+
+## Usage Example
+
+```cpp
+Entity entity(&world);
+entity.position = glm::vec3(0, 100, 0);
+
+while (running) {
+    // Set acceleration from input
+    if (moving_forward) {
+        entity.accel.z = 5.0f;
+    }
+    
+    // Physics update
+    entity.update(delta_time);
+    
+    // Check state
+    if (entity.grounded) {
+        // Can jump
+        entity.jump();
+    }
+    
+    // Toggle flying
+    if (press_f) {
+        entity.flying = !entity.flying;
+    }
+}
+```

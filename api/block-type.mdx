@@ -1,0 +1,231 @@
+---
+title: BlockType
+description: Block type definition with geometry, textures, and collision data
+---
+
+The `BlockType` class defines a renderable block type by combining a `ModelData` template with texture bindings, creating the geometry, collision boxes, and rendering data used by the chunk meshing system.
+
+## Constructor
+
+```cpp
+BlockType(TextureManager* tm, std::string name,
+          std::map<std::string, std::string> face_tex,
+          ModelData md);
+```
+
+<ParamField path="tm" type="TextureManager*">
+  Texture manager to register and look up texture indices
+</ParamField>
+
+<ParamField path="name" type="std::string">
+  Block name (e.g., "stone", "grass", "water")
+</ParamField>
+
+<ParamField path="face_tex" type="std::map<std::string, std::string>">
+  Map of face names to texture file paths
+</ParamField>
+
+<ParamField path="md" type="ModelData">
+  Model template containing vertex positions, UVs, shading, and collision data
+</ParamField>
+
+Creates a block type by:
+1. Copying properties from `ModelData` (transparency, cube flag, glass, etc.)
+2. Extracting collision boxes from model data
+3. Registering textures with the texture manager
+4. Mapping face names to texture array indices using priority rules
+
+## Texture Face Mapping
+
+Textures are applied with the following priority (later assignments override earlier ones):
+
+### Priority 1: Global
+
+```cpp
+face_tex["all"] = "texture.png";  // All 6 faces
+```
+
+### Priority 2: Axis Groups
+
+```cpp
+face_tex["sides"] = "side.png";   // Right, Left, Front, Back (excludes top/bottom)
+face_tex["x"] = "x.png";          // Right, Left
+face_tex["y"] = "y.png";          // Top, Bottom
+face_tex["z"] = "z.png";          // Front, Back
+```
+
+### Priority 3: Individual Faces (Highest)
+
+```cpp
+face_tex["right"]  = "right.png";   // +X face (index 0)
+face_tex["left"]   = "left.png";    // -X face (index 1)
+face_tex["top"]    = "top.png";     // +Y face (index 2)
+face_tex["bottom"] = "bottom.png";  // -Y face (index 3)
+face_tex["front"]  = "front.png";   // +Z face (index 4)
+face_tex["back"]   = "back.png";    // -Z face (index 5)
+```
+
+<Info>
+Individual face assignments always win. For example, a grass block might use `{"sides": "grass_side.png", "top": "grass_top.png", "bottom": "dirt.png"}`.
+</Info>
+
+## Public Members
+
+```cpp
+std::string name;                   // Block identifier
+ModelData model;                     // Source model template
+
+std::map<std::string, std::string> block_face_textures; // Face name -> texture path
+
+bool transparent;                   // Light passes through (e.g., glass, leaves)
+bool is_cube;                       // Standard cube geometry
+bool glass;                         // Special transparency (skylight doesn't decay)
+bool translucent;                   // Requires alpha blending (e.g., water)
+
+std::vector<Collider> colliders;    // AABB collision boxes
+
+std::vector<std::vector<float>> vertex_positions; // Per-face vertex positions
+std::vector<std::vector<float>> tex_coords;       // Per-face UV coordinates
+std::vector<int> tex_indices;                     // Texture array index per face
+std::vector<std::vector<float>> shading_values;   // Per-face ambient occlusion
+```
+
+## Rendering Data Layout
+
+Each face has 4 vertices with the following data:
+
+### Vertex Positions
+
+```cpp
+vertex_positions[face_index] = {x0,y0,z0, x1,y1,z1, x2,y2,z2, x3,y3,z3};
+```
+
+### Texture Coordinates
+
+```cpp
+tex_coords[face_index] = {u0,v0, u1,v1, u2,v2, u3,v3};
+```
+
+### Texture Index
+
+```cpp
+tex_indices[face_index] = atlas_layer_index; // Integer index into texture array
+```
+
+### Shading Values
+
+```cpp
+shading_values[face_index] = {ao0, ao1, ao2, ao3}; // Per-vertex ambient occlusion
+```
+
+## Collision System
+
+Colliders are axis-aligned bounding boxes (AABB) defined by min/max corners:
+
+```cpp
+std::vector<Collider> colliders = {
+    Collider(glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(1.0f, 1.0f, 1.0f)) // Full cube
+};
+```
+
+Some blocks have multiple colliders:
+
+```cpp
+// Fence: 2 colliders (post + crossbar)
+colliders = {
+    Collider(glm::vec3(0.375f, 0.0f, 0.375f), glm::vec3(0.625f, 1.0f, 0.625f)),
+    Collider(glm::vec3(0.0f, 0.375f, 0.375f), glm::vec3(1.0f, 0.625f, 0.625f))
+};
+```
+
+## Example Usage
+
+### Simple Cube Block
+
+```cpp
+// Create stone block
+std::map<std::string, std::string> stone_tex = {
+    {"all", "stone.png"}
+};
+BlockType* stone = new BlockType(&texture_manager, "stone", stone_tex, Models::cube);
+```
+
+### Multi-Texture Block
+
+```cpp
+// Create grass block
+std::map<std::string, std::string> grass_tex = {
+    {"top", "grass_top.png"},
+    {"bottom", "dirt.png"},
+    {"sides", "grass_side.png"}
+};
+BlockType* grass = new BlockType(&texture_manager, "grass", grass_tex, Models::cube);
+```
+
+### Transparent Block
+
+```cpp
+// Create glass block
+std::map<std::string, std::string> glass_tex = {
+    {"all", "glass.png"}
+};
+BlockType* glass = new BlockType(&texture_manager, "glass", glass_tex, Models::glass);
+
+// Flags from ModelData:
+glass->transparent = true;
+glass->glass = true;        // Skylight doesn't decay when passing through
+glass->translucent = true;  // Requires alpha blending
+```
+
+### Non-Cube Block
+
+```cpp
+// Create plant (cross-shaped geometry)
+std::map<std::string, std::string> plant_tex = {
+    {"all", "flower.png"}
+};
+BlockType* flower = new BlockType(&texture_manager, "flower", plant_tex, Models::plant);
+
+// Flags:
+flower->is_cube = false;
+flower->transparent = true;
+flower->colliders = {};  // No collision
+```
+
+## Loading from Definition Files
+
+Blocks are typically loaded from `data/blocks.mccpp`:
+
+```
+1:stone:cube:stone.png
+2:grass:cube:grass_top.png,dirt.png,grass_side.png
+8:water:liquid:water.png
+```
+
+The loading system parses these definitions and constructs `BlockType` instances using the appropriate model templates from `src/models/`.
+
+## Model Templates
+
+Available model templates in `src/models/`:
+- `cube` - Standard full block
+- `glass` - Transparent cube
+- `liquid` - Animated water/lava
+- `plant` - Cross-shaped foliage
+- `torch` - Small vertical post
+- `slab` - Half-height block
+- `stairs` - Stair geometry
+- `door` - Door upper/lower halves
+- `ladder` - Flat wall-mounted plane
+
+## Performance Notes
+
+- Texture registration happens once during block type creation
+- Texture indices are cached in `tex_indices[]` for fast meshing
+- Face data is accessed directly during chunk mesh generation without additional lookups
+
+## See Also
+
+- [World](/api/world) - Block type registry and block placement
+- [Chunk](/api/chunk) - Mesh generation using block types
+- TextureManager - Texture atlas and index management
+- ModelData - Geometry templates

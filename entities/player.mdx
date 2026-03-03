@@ -1,0 +1,273 @@
+---
+title: Player Entity
+description: Player entity implementation with controls, movement, sprinting, FOV changes, and health system
+---
+
+## Overview
+
+The `Player` class extends `Entity` to implement the player character with camera control, input handling, sprinting mechanics, dynamic FOV, and frustum culling.
+
+**Location:** `src/entity/player.h`, `src/entity/player.cpp`
+
+## Class Structure
+
+```cpp
+class Player : public Entity {
+public:
+    float view_width, view_height;
+    glm::mat4 p_matrix, mv_matrix;
+    glm::mat4 vp_matrix;
+    Shader* shader;
+    float eyelevel;
+    glm::vec3 input;
+    float near_plane;
+    float far_plane;
+
+    float speed;
+    float target_speed;
+    bool is_sprinting;
+
+    float max_health = 10.0f;
+    float health = 10.0f;
+
+    glm::vec3 interpolated_position;
+
+    Player(World* w, Shader* s, float vw, float vh);
+    float get_current_fov() const;
+    void update(float dt) override;
+    void update_matrices(float partial_ticks);
+    bool check_in_frustum(glm::ivec3 chunk_pos);
+    void handle_input_sprint(bool ctrl_pressed, bool forward_pressed);
+    void heal(float amount);
+    void take_damage(float amount);
+};
+```
+
+## Speed Constants
+
+The player has two movement speeds defined in `player.cpp:9-10`:
+
+```cpp
+const float WALKING_SPEED = 4.317f;  // blocks/second
+const float SPRINTING_SPEED = 7.0f;  // blocks/second
+```
+
+## Sprint Mechanics
+
+### Input Handling
+
+Sprinting is toggled via `handle_input_sprint()` at `player.cpp:25-37`:
+
+```cpp
+void Player::handle_input_sprint(bool ctrl_pressed, bool forward_pressed) {
+    // Enable sprinting when Ctrl is pressed while moving forward
+    if (ctrl_pressed && forward_pressed) {
+        is_sprinting = true;
+    }
+    // Disable sprinting when not moving forward
+    if (!forward_pressed) {
+        is_sprinting = false;
+    }
+
+    target_speed = is_sprinting ? SPRINTING_SPEED : WALKING_SPEED;
+}
+```
+
+**Sprint Rules:**
+- Sprint activates when Ctrl + Forward are both pressed
+- Sprint automatically stops when forward movement stops
+- Target speed switches between `WALKING_SPEED` and `SPRINTING_SPEED`
+
+### Dynamic FOV
+
+The FOV increases when sprinting to simulate speed. Implementation at `player.cpp:15-23`:
+
+```cpp
+float Player::get_current_fov() const {
+    float denom = (SPRINTING_SPEED - WALKING_SPEED);
+    float factor = 0.0f;
+    if (denom > 0.0001f) {
+        factor = (speed - WALKING_SPEED) / denom;
+    }
+    factor = std::clamp(factor, 0.0f, 1.0f);
+    return Options::FOV + 10.0f * factor;
+}
+```
+
+- Base FOV from `Options::FOV`
+- **+10 degrees** maximum FOV increase at full sprint speed
+- Linear interpolation based on current speed
+- Speed smoothly transitions in `update()`, creating a gradual FOV change
+
+## Movement Update
+
+The `update()` method at `player.cpp:47-79` handles movement logic:
+
+```cpp
+void Player::update(float dt) {
+    // Smooth speed transition (20x per second)
+    if(dt * 20 > 1) speed = target_speed;
+    else speed += (target_speed - speed) * dt * 20;
+
+    float multiplier = speed;
+    // Flying speed is 2x
+    if (flying) multiplier *= 2.0f;
+
+    // Horizontal movement
+    if(input.x || input.z) {
+        // Calculate movement angle from input and rotation
+        float angle = rotation.x - atan2(input.z, input.x) + 1.57079f; // +PI/2
+
+        accel.x = cos(angle) * multiplier;
+        accel.z = sin(angle) * multiplier;
+    }
+
+    // Vertical movement
+    if (flying) {
+        if (input.y != 0) {
+            accel.y = input.y * multiplier;
+        }
+    } else {
+        // Jump only when grounded and space is pressed
+        if(input.y > 0) jump();
+    }
+
+    Entity::update(dt);
+}
+```
+
+**Key Points:**
+- Speed smoothly interpolates to `target_speed` at 20x per second
+- Flying doubles movement speed
+- Input vector (`input.x`, `input.z`) is rotated by player's yaw (`rotation.x`)
+- Jumping only works when grounded in normal mode
+- Flying allows direct vertical control via `input.y`
+
+## Camera & Matrices
+
+### Matrix Updates
+
+The `update_matrices()` method at `player.cpp:81-102` handles view projection with interpolation:
+
+```cpp
+void Player::update_matrices(float partial_ticks) {
+    interpolated_position = glm::mix(old_position, position, partial_ticks);
+
+    // Dynamic FOV when sprinting
+    float fov_mod = get_current_fov();
+
+    p_matrix = glm::perspective(glm::radians(fov_mod), 
+                                view_width/view_height, 
+                                near_plane, far_plane);
+    mv_matrix = glm::mat4(1.0f);
+    mv_matrix = glm::rotate(mv_matrix, rotation.y, glm::vec3(-1,0,0));
+    mv_matrix = glm::rotate(mv_matrix, rotation.x + 1.57f, glm::vec3(0,1,0));
+
+    // Eye position includes step offset for smooth stair climbing
+    mv_matrix = glm::translate(mv_matrix, 
+                               -interpolated_position - glm::vec3(0, eyelevel + step_offset, 0));
+
+    vp_matrix = p_matrix * mv_matrix;
+}
+```
+
+**Features:**
+- Position interpolation for smooth rendering between physics ticks
+- Dynamic FOV based on current speed
+- Eye level at `1.6` blocks above feet (`eyelevel = 1.6f`)
+- `step_offset` smooths camera movement when climbing stairs
+- Near plane: `0.1`, Far plane: `500.0`
+
+### Frustum Culling
+
+The `check_in_frustum()` method at `player.cpp:104-143` performs chunk visibility tests:
+
+```cpp
+bool Player::check_in_frustum(glm::ivec3 chunk_pos) {
+    // Calculate chunk bounds
+    glm::vec3 chunk_min = glm::vec3(chunk_pos.x * CHUNK_WIDTH, 
+                                    chunk_pos.y * CHUNK_HEIGHT, 
+                                    chunk_pos.z * CHUNK_LENGTH);
+    glm::vec3 chunk_max = chunk_min + glm::vec3(CHUNK_WIDTH, CHUNK_HEIGHT, CHUNK_LENGTH);
+    glm::vec3 center = (chunk_min + chunk_max) * 0.5f;
+
+    // Distance culling first
+    float max_dist = static_cast<float>(Options::RENDER_DISTANCE * CHUNK_WIDTH);
+    if (glm::length2(center - position) > max_dist * max_dist) return false;
+
+    // Test all 8 corners against frustum planes
+    // ...
+}
+```
+
+**Algorithm:**
+1. Early reject chunks beyond render distance using squared distance
+2. Transform all 8 chunk corners to clip space via `vp_matrix`
+3. Count corners outside each frustum plane (left/right/top/bottom/near/far)
+4. Reject if all 8 corners are outside the same plane
+5. Otherwise, chunk is potentially visible
+
+## Health System
+
+Simple health management at `player.cpp:39-45`:
+
+```cpp
+void Player::heal(float amount) {
+    health = std::clamp(health + amount, 0.0f, max_health);
+}
+
+void Player::take_damage(float amount) {
+    health = std::clamp(health - amount, 0.0f, max_health);
+}
+```
+
+- Default health: `10.0f` (max and current)
+- Clamped between 0 and `max_health`
+- Currently not visualized in UI
+
+## Initialization
+
+Constructor at `player.cpp:12-13`:
+
+```cpp
+Player::Player(World* w, Shader* s, float vw, float vh)
+: Entity(w), shader(s), view_width(vw), view_height(vh), 
+  eyelevel(1.6f), input(0), near_plane(0.1f), far_plane(500.0f), 
+  speed(4.3f), target_speed(4.3f), is_sprinting(false), 
+  max_health(10.0f), health(10.0f) {}
+```
+
+**Default Values:**
+- Eye level: 1.6 blocks (standard Minecraft height)
+- Initial speed: 4.3 blocks/second
+- Render distance: 0.1 to 500 blocks
+- Full health at spawn
+- Not sprinting by default
+
+## Usage Example
+
+```cpp
+// Create player
+Player player(&world, &shader, window_width, window_height);
+
+// Game loop
+while (running) {
+    // Handle input
+    glm::vec3 input_dir = get_input_direction();
+    player.input = input_dir;
+    player.handle_input_sprint(is_ctrl_pressed, input_dir.z > 0);
+    
+    // Update physics
+    player.update(delta_time);
+    
+    // Update camera for rendering
+    player.update_matrices(interpolation_factor);
+    
+    // Check which chunks to render
+    for (auto& [pos, chunk] : chunks) {
+        if (player.check_in_frustum(pos)) {
+            chunk->draw();
+        }
+    }
+}
+```

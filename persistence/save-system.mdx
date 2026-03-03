@@ -1,0 +1,388 @@
+---
+title: Save System
+description: World loading, chunk streaming, and save/load architecture
+---
+
+The save system manages world persistence, chunk streaming, and dynamic loading/unloading of chunks as the player moves through the world.
+
+## Architecture
+
+The `Save` class (`src/save.h/cpp`) coordinates:
+
+- **Initial world loading** with configurable radius
+- **Chunk streaming** during gameplay
+- **Automatic unloading** of distant chunks
+- **Chunk serialization** using NBT gzip format
+
+## File Organization
+
+Chunks are stored in a Minecraft-style directory structure using base36 encoding:
+
+```
+save/
+  <rx>/<rz>/
+    c.<x>.<z>.dat
+```
+
+Where:
+- `rx = x % 64`, `rz = z % 64` (region subdivision)
+- File naming uses base36 encoding (0-9, a-z)
+- Each `.dat` file contains compressed NBT data for one chunk (16×128×16)
+
+### Base36 Encoding
+
+From `src/save.cpp:16-28`:
+
+```cpp
+std::string to_base36(int value) {
+    std::string chars = "0123456789abcdefghijklmnopqrstuvwxyz";
+    std::string result;
+    if (value == 0) return "0";
+    int val = std::abs(value);
+    while (val > 0) {
+        result = chars[val % 36] + result;
+        val /= 36;
+    }
+    if (value < 0) result = "-" + result;
+    return result;
+}
+```
+
+## World Loading
+
+The `load()` method (`src/save.cpp:221-264`) implements a two-phase loading strategy:
+
+### Phase 1: Eager Loading
+
+Loads a minimal set of chunks around the player with full lighting propagation:
+
+```cpp
+void Save::load(int initial_radius) {
+    glm::ivec3 center_chunk = world->get_chunk_pos(world->player->position);
+    
+    const int radius = Options::RENDER_DISTANCE;
+    const int max_initial = std::max(0, radius - 1);
+    initial_radius = std::clamp(initial_radius, 0, max_initial);
+    
+    // Load chunks within initial_radius with eager_build=true
+    for (const auto& offset : offsets) {
+        glm::ivec3 chunk_pos = center_chunk + offset;
+        if (ring_distance_offset(offset) <= initial_radius) {
+            load_chunk(chunk_pos, true);  // Full lighting + meshing
+            loaded_now++;
+        } else {
+            pending_chunks.push_back(chunk_pos);  // Queue for streaming
+        }
+    }
+}
+```
+
+### Phase 2: Streaming
+
+Remaining chunks are queued for gradual loading during gameplay:
+
+```cpp
+void Save::stream_next(int max_chunks) {
+    int loaded = 0;
+    while (loaded < max_chunks && !pending_chunks.empty()) {
+        glm::ivec3 pos = pending_chunks.front();
+        pending_chunks.pop_front();
+        load_chunk(pos, false);  // Deferred lighting + meshing
+        loaded++;
+    }
+}
+```
+
+Chunks are sorted by distance before queuing (`src/save.cpp:245-250`):
+
+```cpp
+std::sort(offsets.begin(), offsets.end(), [](const glm::ivec3& a, const glm::ivec3& b) {
+    int da = manhattan_distance_offset(a);
+    int db = manhattan_distance_offset(b);
+    if (da == db) return ring_distance_offset(a) < ring_distance_offset(b);
+    return da < db;
+});
+```
+
+## The `eager_build` Flag
+
+The `load_chunk()` method accepts an `eager_build` parameter that controls performance characteristics:
+
+### `eager_build = true` (Initial Load)
+
+From `src/save.cpp:198-200`:
+
+```cpp
+if (eager_build) {
+    world->propagate_skylight_increase(false, std::numeric_limits<int>::max());
+    world->propagate_increase(false, std::numeric_limits<int>::max());
+}
+```
+
+- **Full lighting propagation** in one frame
+- **Immediate mesh generation** for all subchunks
+- Used for the initial radius around spawn
+- Ensures the starting area is fully lit and renderable
+
+### `eager_build = false` (Streaming)
+
+From `info.md:16-20`:
+
+> При `eager_build == false` (стриминг во время игры):
+> - Убраны вызовы полной прогонки освещения. Очереди освещения заполняются, но их обработка происходит уже в `World::tick()` с лимитом `Options::LIGHT_STEPS_PER_TICK` за кадр.
+> - Убрана немедленная генерация всех мешей чанка.
+
+- **Deferred lighting** spread across frames (`Options::LIGHT_STEPS_PER_FRAME` per tick)
+- **Deferred meshing** via `chunk_building_queue` (1 chunk per frame)
+- Prevents FPS drops during streaming
+- Chunks may appear partially lit/built for a few frames
+
+### Performance Impact
+
+From `info.md:26-28`:
+
+> Просадки FPS от резких пиков CPU‑нагрузки при появлении новых чанков должны заметно уменьшиться; цена — новые чанки могут «достраиваться» визуально за несколько кадров вместо мгновенного появления, но фреймтайм становится значительно ровнее.
+
+**Translation**: FPS drops from CPU spikes when new chunks appear are significantly reduced; the cost is that new chunks may "build up" visually over several frames instead of appearing instantly, but frametime becomes much smoother.
+
+## Chunk Streaming
+
+Dynamic loading/unloading is managed by `update_streaming()` (`src/save.cpp:266-328`):
+
+### Queue Management
+
+```cpp
+void Save::update_streaming(glm::vec3 player_pos) {
+    glm::ivec3 current_center = world->get_chunk_pos(player_pos);
+    
+    // Skip if player hasn't moved to a new chunk
+    if (current_center == last_center_chunk) return;
+    
+    last_center_chunk = current_center;
+    int radius = Options::RENDER_DISTANCE;
+    
+    // Queue new chunks within render distance
+    for (int x = -radius; x <= radius; x++) {
+        for (int z = -radius; z <= radius; z++) {
+            if (x * x + z * z > radius * radius) continue;
+            
+            glm::ivec3 chunk_pos = current_center + glm::ivec3(x, 0, z);
+            
+            if (world->chunks.find(chunk_pos) == world->chunks.end()) {
+                // Add to pending queue if not already loaded/queued
+                if (!already_queued) pending_chunks.push_back(chunk_pos);
+            }
+        }
+    }
+}
+```
+
+### Chunk Unloading
+
+Chunks beyond `RENDER_DISTANCE + 3` are automatically unloaded and saved:
+
+```cpp
+const int unload_dist_sq = (radius + 3) * (radius + 3);
+
+for (auto it = world->chunks.begin(); it != world->chunks.end(); ) {
+    int dx = pos.x - current_center.x;
+    int dz = pos.z - current_center.z;
+    int dist_sq = dx * dx + dz * dz;
+    
+    if (dist_sq > unload_dist_sq) {
+        if (c->modified) {
+            save_chunk(c);  // Write to disk if modified
+        }
+        
+        // Unlink neighbors, remove from queues, delete chunk
+        delete c;
+        it = world->chunks.erase(it);
+    } else {
+        ++it;
+    }
+}
+```
+
+## Chunk Loading Process
+
+The `load_chunk()` method (`src/save.cpp:89-219`) follows this sequence:
+
+### 1. Chunk Creation
+
+```cpp
+Chunk* c = new Chunk(world, chunk_pos);
+world->chunks[chunk_pos] = c;
+
+// Link neighbor pointers bidirectionally
+for (int i = 0; i < 6; i++) {
+    glm::ivec3 npos = chunk_pos + Util::DIRECTIONS[i];
+    auto it = world->chunks.find(npos);
+    Chunk* n = (it != world->chunks.end()) ? it->second : nullptr;
+    c->neighbors[i] = n;
+    if (n) n->neighbors[OPPOSITE[i]] = c;
+}
+```
+
+### 2. Load from Disk (or Generate)
+
+From `src/save.cpp:108-148`:
+
+```cpp
+// Try NBT gzip format first
+std::string nbt_path = path + "/" + to_base36(rx) + "/" + to_base36(rz) 
+                     + "/c." + to_base36(x) + "." + to_base36(z) + ".dat";
+if (fs::exists(nbt_path)) {
+    if (NBT::read_blocks_from_gzip(nbt_path, (uint8_t*)c->blocks, sizeof(c->blocks))) {
+        loaded = true;
+    }
+}
+
+// Fallback to legacy binary format
+if (!loaded) {
+    std::string bin_path = path + "/c." + std::to_string(x) + "." + std::to_string(z) + ".dat";
+    std::ifstream in(bin_path, std::ios::binary);
+    if (in.is_open()) {
+        in.read((char*)c->blocks, sizeof(c->blocks));
+        if (in.gcount() == sizeof(c->blocks)) {
+            loaded = true;
+        }
+    }
+}
+
+// Generate flat terrain if no save data exists
+if (!loaded) {
+    for (int lx = 0; lx < CHUNK_WIDTH; lx++) {
+        for (int lz = 0; lz < CHUNK_LENGTH; lz++) {
+            for (int ly = 0; ly < CHUNK_HEIGHT; ly++) {
+                if (ly < 60) c->blocks[lx][ly][lz] = 1;      // Stone
+                else if (ly < 64) c->blocks[lx][ly][lz] = 3; // Dirt
+                else if (ly == 64) c->blocks[lx][ly][lz] = 2; // Grass
+                else c->blocks[lx][ly][lz] = 0;               // Air
+            }
+        }
+    }
+    c->modified = true;
+}
+```
+
+### 3. Lighting Initialization
+
+```cpp
+// Skylight from top + neighbor stitching
+world->init_skylight(c);
+world->stitch_sky_light(c);
+
+// Block light for loaded chunks (scans for light-emitting blocks)
+if (loaded) {
+    for (int lx = 0; lx < CHUNK_WIDTH; lx++) {
+        for (int ly = 0; ly < CHUNK_HEIGHT; ly++) {
+            for (int lz = 0; lz < CHUNK_LENGTH; lz++) {
+                int id = c->blocks[lx][ly][lz];
+                if (world->light_blocks.count(id) != 0) {
+                    c->set_block_light({lx, ly, lz}, 15);
+                    world->light_increase_queue.push_back({global_pos, 15});
+                }
+            }
+        }
+    }
+}
+
+world->stitch_block_light(c);
+```
+
+### 4. Mesh Generation
+
+```cpp
+// Queue mesh updates (actual building deferred if eager_build=false)
+c->update_subchunk_meshes();
+
+// Update neighboring chunk meshes at boundaries
+update_neighbor(Util::EAST);
+update_neighbor(Util::WEST);
+update_neighbor(Util::NORTH);
+update_neighbor(Util::SOUTH);
+```
+
+## Saving Chunks
+
+The `save_chunk()` method (`src/save.cpp:39-69`) writes modified chunks to disk:
+
+```cpp
+bool Save::save_chunk(Chunk* chunk) {
+    if (!chunk) return false;
+    
+    // Create directory structure
+    int rx = x % 64; if (rx < 0) rx += 64;
+    int rz = z % 64; if (rz < 0) rz += 64;
+    std::string dir_path = path + "/" + to_base36(rx) + "/" + to_base36(rz);
+    
+    if (!fs::exists(dir_path)) {
+        fs::create_directories(dir_path);
+    }
+    
+    std::string filename = dir_path + "/c." + to_base36(x) + "." + to_base36(z) + ".dat";
+    
+    bool success = NBT::write_blocks_to_gzip(
+        filename,
+        (const uint8_t*)chunk->blocks,
+        CHUNK_WIDTH, CHUNK_HEIGHT, CHUNK_LENGTH
+    );
+    
+    if (success) {
+        chunk->modified = false;
+    }
+    
+    return success;
+}
+```
+
+The `save()` method iterates all chunks and saves modified ones:
+
+```cpp
+void Save::save() {
+    for (auto& kv : world->chunks) {
+        Chunk* c = kv.second;
+        if (!c->modified) continue;
+        
+        if (save_chunk(c)) {
+            saved_count++;
+        }
+    }
+    std::cout << "Saved " << saved_count << " chunks." << std::endl;
+}
+```
+
+## Configuration
+
+Relevant settings from `src/options.h`:
+
+- `Options::RENDER_DISTANCE` - Maximum chunk loading radius
+- `Options::LIGHT_STEPS_PER_TICK` - Lighting propagation steps per frame (default 2048)
+- `Options::CHUNK_UPDATES` - Subchunk mesh updates per frame
+
+## Integration
+
+From `src/main.cpp`, the save system is used:
+
+```cpp
+Save save(&world);
+save.load(2);  // Load initial radius of 2 chunks
+
+// Game loop
+while (!glfwWindowShouldClose(window)) {
+    // Update streaming based on player position
+    save.update_streaming(player.position);
+    
+    // Load up to 1 chunk per frame
+    if (save.has_pending_chunks()) {
+        save.stream_next(1);
+    }
+    
+    // ... rendering ...
+}
+
+// On save request (S key)
+if (key == GLFW_KEY_S && action == GLFW_PRESS) {
+    save.save();
+}
+```

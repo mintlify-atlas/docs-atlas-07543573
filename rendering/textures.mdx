@@ -1,0 +1,260 @@
+---
+title: "Texture Management"
+description: "Texture atlas system, texture array loading, and block texture management in MC-CPP"
+---
+
+MC-CPP uses a texture array atlas system for efficient block texture rendering. All block textures are loaded into a single `GL_TEXTURE_2D_ARRAY`, eliminating texture binding overhead during rendering.
+
+## TextureManager Class
+
+Defined in `src/renderer/texture_manager.h`:
+
+```cpp
+class TextureManager {
+public:
+    int texture_width, texture_height, max_textures;
+    std::vector<std::string> textures;
+    GLuint texture_array;
+
+    TextureManager(int w, int h, int max_tex);
+    void generate_mipmaps();
+    void add_texture(std::string texture);
+    int get_texture_index(std::string texture);
+};
+```
+
+### Initialization
+
+Create a texture manager with fixed dimensions:
+
+```cpp
+TextureManager tm(16, 16, 256);  // 16×16 textures, max 256 layers
+```
+
+This allocates a `GL_TEXTURE_2D_ARRAY` with:
+- Width: 16 pixels
+- Height: 16 pixels  
+- Depth: 256 layers (one per texture)
+- Format: `GL_RGBA` with `GL_UNSIGNED_BYTE`
+- Mipmapping: Controlled by `Options::MIPMAP_TYPE`
+
+See `src/renderer/texture_manager.cpp:8-22` for initialization details.
+
+## Texture Loading
+
+### Adding Textures
+
+```cpp
+tm.add_texture("stone");        // Loads assets/textures/stone.png
+tm.add_texture("dirt");
+tm.add_texture("grass_side");
+// ... add all block textures
+
+tm.generate_mipmaps();  // Generate mipmaps after all textures loaded
+```
+
+**Important**: Textures are automatically flipped vertically (`stbi_set_flip_vertically_on_load(true)`) to match OpenGL's bottom-left origin.
+
+### Texture Indices
+
+Textures are assigned sequential indices based on load order:
+
+```cpp
+int stone_idx = tm.get_texture_index("stone");  // Returns 0 (first loaded)
+int dirt_idx = tm.get_texture_index("dirt");    // Returns 1 (second loaded)
+```
+
+These indices are used as the Z coordinate when sampling the texture array:
+
+```glsl
+vec4 color = texture(u_TextureArraySampler, vec3(uv.x, uv.y, layer));
+```
+
+### Deduplication
+
+Attempting to add the same texture multiple times is safe - it will only be loaded once:
+
+```cpp
+tm.add_texture("stone");
+tm.add_texture("stone");  // No-op, texture already exists
+```
+
+See `src/renderer/texture_manager.cpp:31-50` for the loading implementation.
+
+## Texture Array Binding
+
+### Critical Invariant
+
+**The texture array MUST be bound before any `glTexSubImage3D` or `glGenerateMipmap` calls.**
+
+To prevent accidentally uploading block textures into the shadow map (which is also a `GL_TEXTURE_2D_ARRAY`), `TextureManager` explicitly binds its texture array in:
+
+1. **Constructor** (before `glTexImage3D`)
+   ```cpp
+   glBindTexture(GL_TEXTURE_2D_ARRAY, texture_array);
+   ```
+
+2. **generate_mipmaps()** (before `glGenerateMipmap`)
+   ```cpp
+   glBindTexture(GL_TEXTURE_2D_ARRAY, texture_array);
+   glGenerateMipmap(GL_TEXTURE_2D_ARRAY);
+   ```
+
+3. **add_texture()** (before `glTexSubImage3D`)
+   ```cpp
+   glBindTexture(GL_TEXTURE_2D_ARRAY, texture_array);
+   glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, index, ...);
+   ```
+
+This was the main source of "all black blocks" bugs before explicit binding was added.
+
+### Rendering Setup
+
+During rendering, bind the texture array to texture unit 0:
+
+```cpp
+glActiveTexture(GL_TEXTURE0);
+glBindTexture(GL_TEXTURE_2D_ARRAY, tm.texture_array);
+shader.use();
+shader.setInt(shader.find_uniform("u_TextureArraySampler"), 0);
+```
+
+See `src/world.cpp:634-635` for the main rendering setup.
+
+## Texture Filtering and Mipmaps
+
+### Filter Modes
+
+Configured via `Options::MIPMAP_TYPE` in `src/options.h`:
+
+```cpp
+inline int MIPMAP_TYPE = GL_NEAREST_MIPMAP_LINEAR;  // Default
+```
+
+Common options:
+- `GL_NEAREST` - No mipmaps, nearest neighbor
+- `GL_LINEAR` - No mipmaps, bilinear filtering
+- `GL_NEAREST_MIPMAP_NEAREST` - Mipmaps, nearest neighbor
+- `GL_NEAREST_MIPMAP_LINEAR` - Mipmaps, trilinear filtering (default)
+- `GL_LINEAR_MIPMAP_LINEAR` - Mipmaps, fully linear
+
+Magnification filter is always `GL_NEAREST` for pixel-perfect textures at close range.
+
+### Mipmap Generation
+
+Mipmaps are generated after all textures are loaded:
+
+```cpp
+tm.generate_mipmaps();
+```
+
+This improves rendering performance and reduces aliasing at distance.
+
+## Texture Format
+
+### File Format
+
+All textures must be PNG files in `assets/textures/`:
+
+```
+assets/textures/
+├── stone.png
+├── dirt.png
+├── grass_top.png
+├── grass_side.png
+├── wood_oak.png
+└── ...
+```
+
+### Dimensions
+
+All textures must match the dimensions specified in the `TextureManager` constructor (typically 16×16).
+
+**Mismatched dimensions**: Textures with different sizes may still load but will be stretched/compressed to fit the atlas dimensions, causing visual artifacts.
+
+### Color Channels
+
+Textures are loaded as RGBA:
+- RGB channels: Color data
+- Alpha channel: Transparency (used for alpha testing in shaders)
+
+Textures without alpha channels will have alpha set to 255 (fully opaque) by stb_image.
+
+## Block Texture Assignment
+
+Block types reference textures by name in `data/blocks.mccpp`:
+
+```
+1 stone "Stone" cube stone stone stone stone stone stone
+2 grass "Grass" cube grass_top grass_side grass_side grass_side grass_side dirt
+3 dirt "Dirt" cube dirt dirt dirt dirt dirt dirt
+```
+
+Each block can specify up to 6 textures (one per face): top, north, south, east, west, bottom.
+
+The texture names are resolved to indices via `TextureManager::get_texture_index()` when loading block definitions.
+
+## Debugging
+
+### Pure Black Blocks
+
+**Symptom**: All blocks render as solid black.
+
+**Cause**: Texture array is not bound correctly during rendering.
+
+**Fix**: 
+1. Ensure `glBindTexture(GL_TEXTURE_2D_ARRAY, tm.texture_array)` is called before drawing
+2. Verify `u_TextureArraySampler` uniform is set to 0
+3. Check that `GL_TEXTURE0` is active
+
+### Magenta/Pink Blocks
+
+**Symptom**: Blocks render as diagnostic magenta color.
+
+**Cause**: Texture index is invalid or texture failed to load.
+
+**Fix**:
+1. Check console for "Failed load tex:" messages
+2. Verify PNG files exist in `assets/textures/`
+3. Check file permissions
+
+### Texture Appears in Wrong Layer
+
+**Symptom**: Wrong texture shows on blocks.
+
+**Cause**: Shadow map was bound when `add_texture()` was called, uploading block textures into the wrong array.
+
+**Fix**: Ensure `TextureManager` methods always bind `texture_array` before GL calls (already implemented in current version).
+
+See `AGENTS.md:41-49` for details on this bug and fix.
+
+## Performance Considerations
+
+### Single Texture Array
+
+Using a texture array eliminates texture binding overhead:
+- No `glBindTexture` calls between draw calls
+- All chunks can be rendered with the same GL state
+- GPU can batch draw calls more efficiently
+
+### Atlas Size
+
+The maximum number of textures (256 by default) is a hard limit:
+- Cannot add more textures than `max_textures` specified at construction
+- Exceeding this limit will cause GL errors
+- Increase if you need more unique textures (e.g., 512)
+
+### Memory Usage
+
+Texture array memory = `width × height × depth × 4 bytes × (1 + mipmap levels)`
+
+For 16×16×256 with mipmaps:
+- Base level: 16 × 16 × 256 × 4 = 256 KB
+- Mipmaps: ~85 KB additional
+- Total: ~341 KB (negligible on modern GPUs)
+
+## Related Pages
+
+- [Rendering Overview](/rendering/overview) - Texture usage in rendering pipeline
+- [Shader System](/rendering/shaders) - Sampling textures in shaders
+- [Shadow Mapping](/rendering/shadows) - Shadow map texture array interaction

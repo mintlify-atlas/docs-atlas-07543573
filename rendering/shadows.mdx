@@ -1,0 +1,445 @@
+---
+title: "Cascaded Shadow Mapping (CSM)"
+description: "Implementation of real-time directional shadows using Cascaded Shadow Maps in MC-CPP"
+---
+
+MC-CPP implements Cascaded Shadow Mapping (CSM) for real-time directional shadows from the sun/moon. This advanced technique provides high-quality shadows at all distances while maintaining good performance.
+
+## Overview
+
+CSM splits the view frustum into multiple cascades, each with its own shadow map at different distances. This provides:
+
+- **High detail** near the camera (fine shadow map resolution)
+- **Extended range** far from the camera (coarse shadow map resolution)
+- **Smooth transitions** between cascades using PCF filtering
+
+## Architecture
+
+### Core Components
+
+The shadow system is owned by `World` class (`src/world.h:42-61`):
+
+```cpp
+class World {
+    // Shadow resources
+    Shader* shadow_shader;              // Depth-only shader
+    GLuint shadow_fbo;                  // Framebuffer for shadow rendering
+    GLuint shadow_map;                  // GL_TEXTURE_2D_ARRAY (depth)
+    int shadow_map_resolution;          // Per-cascade resolution (e.g., 2048)
+    int shadow_cascade_count;           // Number of cascades (1-4)
+    bool shadows_enabled;               // Runtime toggle
+    
+    std::vector<glm::mat4> shadow_matrices;  // Light-space matrices
+    std::vector<float> shadow_splits;        // Split distances
+    
+    // Cached uniform locations in main shader
+    int shader_shadow_map_loc;
+    int shader_light_space_mats_loc;
+    int shader_cascade_splits_loc;
+    int shader_cascade_count_loc;
+    // ... (see src/world.h:53-61)
+};
+```
+
+### Initialization
+
+Shadow resources are initialized in `World::init_shadow_resources()` (`src/world.cpp:431-493`):
+
+```cpp
+bool World::init_shadow_resources() {
+    shadow_map_resolution = Options::SHADOW_MAP_RESOLUTION;  // 2048
+    shadow_cascade_count = std::max(1, std::min(Options::SHADOW_CASCADES, 4));
+    
+    // 1. Load shadow shader
+    shadow_shader = new Shader(
+        "assets/shaders/shadow/vert.glsl",
+        "assets/shaders/shadow/frag.glsl"
+    );
+    if (!shadow_shader->valid()) return false;
+    
+    // 2. Create framebuffer
+    glGenFramebuffers(1, &shadow_fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, shadow_fbo);
+    
+    // 3. Create depth texture array
+    glGenTextures(1, &shadow_map);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, shadow_map);
+    glTexImage3D(
+        GL_TEXTURE_2D_ARRAY, 0, GL_DEPTH_COMPONENT24,
+        shadow_map_resolution, shadow_map_resolution, shadow_cascade_count,
+        0, GL_DEPTH_COMPONENT, GL_FLOAT, nullptr
+    );
+    
+    // Nearest filtering for crisp shadows
+    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    
+    // 4. Attach to framebuffer
+    glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, 
+                              shadow_map, 0, 0);
+    glDrawBuffer(GL_NONE);  // No color output
+    glReadBuffer(GL_NONE);
+    
+    // 5. Verify framebuffer completeness
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        // Cleanup and return false
+    }
+    
+    return true;
+}
+```
+
+**If initialization fails**, shadows are automatically disabled and rendering continues without shadows.
+
+## Cascade Calculation
+
+### Split Distribution
+
+Cascades are distributed using a log/linear hybrid scheme (`src/world.cpp:495-571`):
+
+```cpp
+void World::update_shadow_cascades() {
+    float near_plane = player->near_plane;
+    float far_plane = player->far_plane;
+    float lambda = Options::SHADOW_LOG_WEIGHT;  // 0.85 default
+    
+    for (int i = 0; i < shadow_cascade_count; ++i) {
+        float p = (i + 1) / static_cast<float>(shadow_cascade_count);
+        
+        // Logarithmic split (more detail near camera)
+        float logSplit = near_plane * std::pow(far_plane / near_plane, p);
+        
+        // Linear split (even distribution)
+        float linSplit = near_plane + (far_plane - near_plane) * p;
+        
+        // Blend based on lambda
+        float splitDist = lambda * logSplit + (1.0f - lambda) * linSplit;
+        shadow_splits[i] = splitDist;
+    }
+}
+```
+
+**SHADOW_LOG_WEIGHT** (`0.0` to `1.0`):
+- `0.0` = Linear distribution (even split)
+- `1.0` = Logarithmic distribution (more near detail)
+- `0.85` = Default (good balance)
+
+### Light-Space Matrices
+
+For each cascade, compute a tight-fitting orthographic projection (`src/world.cpp:526-570`):
+
+```cpp
+for (int i = 0; i < shadow_cascade_count; ++i) {
+    float prevSplit = (i == 0) ? near_plane : shadow_splits[i - 1];
+    float splitDist = shadow_splits[i];
+    
+    // 1. Compute frustum corners in view-space
+    float xn = prevSplit * tanHalfFovX;
+    float yn = prevSplit * tanHalfFovY;
+    float xf = splitDist * tanHalfFovX;
+    float yf = splitDist * tanHalfFovY;
+    
+    glm::vec3 cornersView[8] = {
+        { -xn,  yn, -prevSplit }, {  xn,  yn, -prevSplit },
+        { -xn, -yn, -prevSplit }, {  xn, -yn, -prevSplit },
+        { -xf,  yf, -splitDist }, {  xf,  yf, -splitDist },
+        { -xf, -yf, -splitDist }, {  xf, -yf, -splitDist }
+    };
+    
+    // 2. Transform to world-space
+    glm::mat4 invView = glm::inverse(player->mv_matrix);
+    glm::vec3 cornersWorld[8];
+    glm::vec3 center(0.0f);
+    for (int c = 0; c < 8; ++c) {
+        cornersWorld[c] = invView * glm::vec4(cornersView[c], 1.0f);
+        center += cornersWorld[c];
+    }
+    center /= 8.0f;
+    
+    // 3. Compute bounding sphere radius
+    float radius = 0.0f;
+    for (int c = 0; c < 8; ++c) {
+        radius = std::max(radius, glm::length(cornersWorld[c] - center));
+    }
+    radius = std::ceil(radius * 16.0f) / 16.0f;  // Snap to 1/16 blocks
+    
+    // 4. Build light-space view/projection
+    glm::vec3 lightDir = get_light_direction();
+    glm::vec3 lightPos = center - lightDir * (radius * 2.0f);
+    glm::mat4 lightView = glm::lookAt(lightPos, center, glm::vec3(0,1,0));
+    glm::mat4 lightProj = glm::ortho(-radius, radius, -radius, radius, 
+                                     0.1f, radius * 4.0f);
+    
+    shadow_matrices[i] = lightProj * lightView;
+}
+```
+
+**Key optimizations**:
+- Sphere-based bounds (simpler than AABB fitting)
+- Radius snapping to 1/16 block increments (reduces shadow shimmering)
+- Light position offset ensures all geometry is in front of near plane
+
+## Shadow Rendering Pass
+
+### Render Loop
+
+Called before main rendering in `World::render_shadows()` (`src/world.cpp:573-622`):
+
+```cpp
+void World::render_shadows() {
+    if (!shadows_enabled || !shadow_shader) return;
+    
+    update_shadow_cascades();  // Recalculate matrices each frame
+    
+    // Save current GL state
+    GLint viewport[4];
+    glGetIntegerv(GL_VIEWPORT, viewport);
+    GLint prevDrawBuffer, prevReadBuffer;
+    glGetIntegerv(GL_DRAW_BUFFER, &prevDrawBuffer);
+    glGetIntegerv(GL_READ_BUFFER, &prevReadBuffer);
+    
+    // Setup shadow rendering
+    glViewport(0, 0, shadow_map_resolution, shadow_map_resolution);
+    glBindFramebuffer(GL_FRAMEBUFFER, shadow_fbo);
+    glDrawBuffer(GL_NONE);
+    glReadBuffer(GL_NONE);
+    
+    shadow_shader->use();
+    int chunkLoc = shadow_shader->find_uniform("u_ChunkPosition");
+    int lightSpaceLoc = shadow_shader->find_uniform("u_LightSpaceMatrix");
+    
+    // Bind block texture array for alpha testing
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, texture_manager->texture_array);
+    
+    // Render each cascade
+    for (int i = 0; i < shadow_cascade_count; ++i) {
+        // Attach cascade layer to framebuffer
+        glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+                                  shadow_map, 0, i);
+        glClear(GL_DEPTH_BUFFER_BIT);
+        
+        // Upload light-space matrix
+        shadow_shader->setMat4(lightSpaceLoc, shadow_matrices[i]);
+        
+        // Draw all visible chunks
+        for (auto* c : visible_chunks) {
+            c->draw(GL_TRIANGLES, shadow_shader, chunkLoc);
+        }
+    }
+    
+    // Restore GL state
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDrawBuffer(prevDrawBuffer);
+    glReadBuffer(prevReadBuffer);
+    glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
+}
+```
+
+**Critical**: GL state (viewport, draw/read buffers) must be restored after the shadow pass, otherwise the main pass will be blank.
+
+### Alpha Testing
+
+The shadow shader performs alpha testing for foliage/transparent blocks:
+
+```glsl
+// assets/shaders/shadow/frag.glsl
+void main(void) {
+    vec4 tex = texture(u_TextureArraySampler, v_TexCoords);
+    if (tex.a < 0.5) discard;
+    // Depth written automatically to GL_DEPTH_ATTACHMENT
+}
+```
+
+This prevents leaves and glass from casting solid shadows.
+
+## Shadow Sampling in Main Shader
+
+### Cascade Selection
+
+In the fragment shader, select cascade based on view-space depth (`colored_lighting/frag.glsl:23-32`):
+
+```glsl
+float calculateShadowFactor(vec3 worldPos, float viewDepth) {
+    if (u_ShadowCascadeCount <= 0) return 1.0;  // Shadows disabled
+    
+    // Find cascade index
+    int cascadeIndex = u_ShadowCascadeCount - 1;  // Default to last
+    for (int i = 0; i < u_ShadowCascadeCount; ++i) {
+        if (viewDepth < u_CascadeSplits[i]) {
+            cascadeIndex = i;
+            break;
+        }
+    }
+    
+    // ... (continue with shadow sampling)
+}
+```
+
+### Shadow Map Lookup
+
+Transform world position to light-space and sample depth (`colored_lighting/frag.glsl:34-43`):
+
+```glsl
+vec4 lightClip = u_LightSpaceMatrices[cascadeIndex] * vec4(worldPos, 1.0);
+vec3 lightND = lightClip.xyz / lightClip.w;        // NDC coords
+vec3 lightUVZ = lightND * 0.5 + 0.5;               // [0,1] range
+
+// Out of bounds check
+if (lightUVZ.x < 0.0 || lightUVZ.x > 1.0 ||
+    lightUVZ.y < 0.0 || lightUVZ.y > 1.0 ||
+    lightUVZ.z < 0.0 || lightUVZ.z > 1.0) {
+    return 1.0;  // Outside shadow map = fully lit
+}
+```
+
+### PCF Filtering
+
+Percentage-Closer Filtering (PCF) samples multiple depth values for soft shadows (`colored_lighting/frag.glsl:45-63`):
+
+```glsl
+int radius = u_ShadowPCFRadius;  // 1 = 3×3 kernel, 2 = 5×5
+
+float samples = 0.0;
+float visible = 0.0;
+
+for (int x = -radius; x <= radius; ++x) {
+    for (int y = -radius; y <= radius; ++y) {
+        vec2 offset = vec2(x, y) * u_ShadowTexelSize;
+        float closestDepth = texture(
+            u_ShadowMap, 
+            vec3(lightUVZ.xy + offset, cascadeIndex)
+        ).r;
+        
+        float currentDepth = lightUVZ.z - u_ShadowMinBias;
+        if (currentDepth <= closestDepth) visible += 1.0;
+        samples += 1.0;
+    }
+}
+
+float visibility = visible / samples;
+return mix(0.9, 1.0, visibility);  // Soft shadows [0.9, 1.0]
+```
+
+**Shadow softness**: Currently clamped to `[0.9, 1.0]` to avoid overly dark shadows during development. Can be adjusted to `[0.0, 1.0]` for full shadow intensity.
+
+## Configuration Options
+
+In `src/options.h:20-28`:
+
+```cpp
+inline bool SHADOWS_ENABLED = true;          // Master toggle
+inline int SHADOW_MAP_RESOLUTION = 2048;     // Per-cascade resolution
+inline int SHADOW_CASCADES = 4;              // Number of cascades (1-4)
+inline float SHADOW_LOG_WEIGHT = 0.85f;      // Log/linear split blend
+inline float SHADOW_MIN_BIAS = 0.0006f;      // Depth bias (shadow acne)
+inline float SHADOW_SLOPE_BIAS = 0.0025f;    // Reserved for future use
+inline int SHADOW_PCF_RADIUS = 1;            // PCF kernel radius
+```
+
+### Performance Tuning
+
+**SHADOW_MAP_RESOLUTION**:
+- Higher = sharper shadows, more memory/fillrate
+- Lower = softer shadows, better performance
+- Common values: 1024, 2048, 4096
+
+**SHADOW_CASCADES**:
+- More cascades = better quality at distance, more draw calls
+- Fewer cascades = worse quality, better performance
+- Typical: 3-4 cascades for good quality
+
+**SHADOW_PCF_RADIUS**:
+- 0 = No PCF, hard shadows
+- 1 = 3×3 PCF, soft shadows (9 samples)
+- 2 = 5×5 PCF, very soft shadows (25 samples)
+
+## GL State Interactions (Critical)
+
+### TextureManager Binding
+
+**Problem**: Both shadow map and texture atlas are `GL_TEXTURE_2D_ARRAY`. If the shadow map is bound when `TextureManager::add_texture()` is called, block textures upload into the wrong texture.
+
+**Solution**: `TextureManager` always explicitly binds `texture_array` before GL calls (`src/renderer/texture_manager.cpp:14, 26, 43`):
+
+```cpp
+void TextureManager::add_texture(std::string texture) {
+    // ...
+    glBindTexture(GL_TEXTURE_2D_ARRAY, texture_array);  // CRITICAL
+    glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, index, ...);
+}
+```
+
+See `AGENTS.md:41-49` for detailed explanation of this bug.
+
+### Shader Sampler Setup
+
+In `World::draw()` (`src/world.cpp:630-656`):
+
+```cpp
+shader->use();
+
+// Texture array on unit 0
+int texLoc = shader->find_uniform("u_TextureArraySampler");
+if (texLoc >= 0) shader->setInt(texLoc, 0);
+
+if (shadows_enabled) {
+    // Shadow map on unit 1
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, shadow_map);
+    
+    int shadowLoc = shader->find_uniform("u_ShadowMap");
+    if (shadowLoc >= 0) shader->setInt(shadowLoc, 1);
+    
+    // Upload shadow uniforms
+    shader->setMat4Array(shader_light_space_mats_loc, shadow_matrices);
+    shader->setFloatArray(shader_cascade_splits_loc, shadow_splits);
+    shader->setInt(shader_cascade_count_loc, shadow_cascade_count);
+    // ...
+} else {
+    // Disable shadows in shader
+    shader->setInt(shader_cascade_count_loc, 0);
+}
+```
+
+**Invariant**: Texture unit 0 = block atlas, texture unit 1 = shadow map.
+
+## Debugging Tips
+
+### Pure Black Blocks When Shadows Enabled
+
+**Cause**: Texture atlas writes went into shadow map.
+
+**Fix**: 
+1. Check `TextureManager` always binds `texture_array` before uploads
+2. Verify initialization order (texture manager before world/shadows)
+
+### Black Screen After Shadow Pass
+
+**Cause**: `glDrawBuffer(GL_NONE)` or viewport not restored.
+
+**Fix**: Ensure `render_shadows()` restores all GL state (`src/world.cpp:618-621`).
+
+### Shadow Shimmering
+
+**Cause**: Light-space matrices change every frame due to camera movement.
+
+**Mitigation**: Radius snapping to 1/16 block increments helps reduce this (`src/world.cpp:560`).
+
+### No Shadows Visible
+
+**Check**:
+1. `Options::SHADOWS_ENABLED = true`
+2. Shadow shader compiled successfully
+3. `u_ShadowCascadeCount > 0` in main shader
+4. Shadow map bound to texture unit 1
+5. Light direction not perpendicular to ground
+
+## Related Pages
+
+- [Rendering Overview](/rendering/overview) - Shadow pass in render loop
+- [Shader System](/rendering/shaders) - Shadow shader details
+- [Lighting System](/rendering/lighting) - How shadows combine with lighting
+- [Texture Management](/rendering/textures) - Texture array binding issues

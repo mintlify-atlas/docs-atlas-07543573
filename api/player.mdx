@@ -1,0 +1,242 @@
+---
+title: Player
+description: Player entity with camera, movement, sprinting, and health system
+---
+
+The `Player` class extends `Entity` to provide player-specific functionality including camera matrices, view frustum culling, sprinting mechanics, and health management.
+
+## Constructor
+
+```cpp
+Player(World* w, Shader* s, float vw, float vh);
+```
+
+<ParamField path="w" type="World*">
+  Pointer to the world instance
+</ParamField>
+
+<ParamField path="s" type="Shader*">
+  Pointer to the shader for uploading camera matrices
+</ParamField>
+
+<ParamField path="vw" type="float">
+  Viewport width in pixels
+</ParamField>
+
+<ParamField path="vh" type="float">
+  Viewport height in pixels
+</ParamField>
+
+Creates a player with default settings:
+- Eye level: 1.6 blocks
+- Near plane: 0.1
+- Far plane: 500.0
+- Walking speed: 4.317 blocks/second
+- Health: 10.0 / 10.0
+
+## Camera & Matrices
+
+### update_matrices
+
+```cpp
+void update_matrices(float partial_ticks);
+```
+
+<ParamField path="partial_ticks" type="float">
+  Interpolation factor between previous and current position (0.0 to 1.0) for smooth rendering
+</ParamField>
+
+Updates view and projection matrices:
+- Interpolates position for smooth rendering between ticks
+- Computes dynamic FOV based on sprint speed
+- Builds perspective projection matrix (`p_matrix`)
+- Builds model-view matrix (`mv_matrix`) with rotation and translation
+- Uploads `u_MVPMatrix` and `u_ViewMatrix` to shader
+
+<Info>
+Always call `shader->use()` before `update_matrices()` to ensure uniforms are uploaded to the correct program.
+</Info>
+
+### get_current_fov
+
+```cpp
+float get_current_fov() const;
+```
+
+Returns the current field of view in degrees, dynamically adjusted based on sprint speed:
+
+```cpp
+float fov = Options::FOV + 10.0f * sprint_factor; // sprint_factor: 0.0 to 1.0
+```
+
+Used by both `update_matrices()` and shadow cascade calculations to ensure consistency.
+
+### check_in_frustum
+
+```cpp
+bool check_in_frustum(glm::ivec3 chunk_pos);
+```
+
+<ParamField path="chunk_pos" type="glm::ivec3">
+  Chunk coordinates to test
+</ParamField>
+
+Performs view frustum culling on a chunk's bounding box. Returns `true` if the chunk is visible, `false` if completely outside the view frustum. Also performs distance culling based on `Options::RENDER_DISTANCE`.
+
+## Movement & Input
+
+### update
+
+```cpp
+void update(float dt) override;
+```
+
+<ParamField path="dt" type="float">
+  Delta time in seconds
+</ParamField>
+
+Processes player movement:
+- Smoothly interpolates speed changes for FOV transitions
+- Converts input vector to world-space acceleration based on view direction
+- Handles flying mode (2× speed multiplier)
+- Processes jump input (only when grounded in non-flying mode)
+- Calls `Entity::update(dt)` for physics integration
+
+### handle_input_sprint
+
+```cpp
+void handle_input_sprint(bool ctrl_pressed, bool forward_pressed);
+```
+
+<ParamField path="ctrl_pressed" type="bool">
+  Whether the sprint key (Ctrl) is currently pressed
+</ParamField>
+
+<ParamField path="forward_pressed" type="bool">
+  Whether the forward movement key (W) is currently pressed
+</ParamField>
+
+Manages sprint state:
+- Activates sprinting when both Ctrl and W are pressed
+- Deactivates sprinting when forward movement stops
+- Updates `target_speed` to `SPRINTING_SPEED` (7.0) or `WALKING_SPEED` (4.317)
+
+## Health System
+
+### heal
+
+```cpp
+void heal(float amount);
+```
+
+<ParamField path="amount" type="float">
+  Health points to restore
+</ParamField>
+
+Increases health by the specified amount, clamped to `max_health`.
+
+### take_damage
+
+```cpp
+void take_damage(float amount);
+```
+
+<ParamField path="amount" type="float">
+  Health points to subtract
+</ParamField>
+
+Decreases health by the specified amount, clamped to 0.
+
+## Public Members
+
+```cpp
+float view_width, view_height;      // Viewport dimensions
+glm::mat4 p_matrix;                 // Projection matrix
+glm::mat4 mv_matrix;                // Model-view matrix
+glm::mat4 vp_matrix;                // Combined view-projection matrix
+Shader* shader;                     // Shader for uniform uploads
+
+float eyelevel;                     // Eye height above feet (1.6)
+glm::vec3 input;                    // Input vector (x: strafe, y: jump/fly, z: forward)
+float near_plane, far_plane;        // Frustum clip planes
+
+float speed;                        // Current speed (smoothly interpolated)
+float target_speed;                 // Target speed (walking or sprinting)
+bool is_sprinting;                  // Sprint state
+
+float max_health;                   // Maximum health (10.0)
+float health;                       // Current health (0.0 to 10.0)
+
+glm::vec3 interpolated_position;    // Position interpolated for rendering
+```
+
+## Inherited from Entity
+
+```cpp
+glm::vec3 position;                 // World position
+glm::vec3 rotation;                 // Rotation (x: yaw, y: pitch)
+glm::vec3 velocity;                 // Current velocity
+glm::vec3 accel;                    // Acceleration input
+bool flying;                        // Flying mode enabled
+bool on_ground;                     // Standing on solid block
+float step_offset;                  // Step-up animation offset
+```
+
+## Example Usage
+
+```cpp
+// Create player
+Player player(&world, &shader, 1920.0f, 1080.0f);
+player.position = glm::vec3(0, 70, 0);
+
+// Process input
+player.input.z = 1.0f;  // Move forward
+player.handle_input_sprint(true, true); // Start sprinting
+
+// Update physics
+player.update(deltaTime);
+
+// Update camera for rendering
+shader.use();
+player.update_matrices(1.0f);
+
+// Check chunk visibility
+if (player.check_in_frustum(glm::ivec3(0, 0, 0))) {
+    // Render chunk at (0, 0, 0)
+}
+
+// Health system
+player.take_damage(2.0f);
+if (player.health > 0.0f) {
+    player.heal(1.0f);
+}
+```
+
+## Movement Constants
+
+```cpp
+const float WALKING_SPEED = 4.317f;    // Blocks per second
+const float SPRINTING_SPEED = 7.0f;    // Blocks per second
+```
+
+## Camera Math
+
+The camera transformation applies rotations and translation in this order:
+
+```cpp
+mv_matrix = glm::mat4(1.0f);
+mv_matrix = glm::rotate(mv_matrix, rotation.y, glm::vec3(-1,0,0)); // Pitch
+mv_matrix = glm::rotate(mv_matrix, rotation.x + 1.57f, glm::vec3(0,1,0)); // Yaw + 90°
+mv_matrix = glm::translate(mv_matrix, -(interpolated_position + glm::vec3(0, eyelevel + step_offset, 0)));
+```
+
+The view-projection matrix is then:
+
+```cpp
+vp_matrix = p_matrix * mv_matrix;
+```
+
+## See Also
+
+- [World](/api/world) - World management and rendering
+- Entity (base class) - Physics and collision system

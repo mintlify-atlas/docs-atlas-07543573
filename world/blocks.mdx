@@ -1,0 +1,420 @@
+---
+title: Block Types & Models
+description: Complete guide to MC-CPP's block type system including model definitions, texture mapping, and the blocks.mccpp format
+---
+
+MC-CPP uses a flexible **block type system** that separates geometry (models) from appearance (textures) and behavior (flags).
+
+## Block Type Architecture
+
+### BlockType Class
+
+The `BlockType` class (`src/renderer/block_type.h:9-28`) combines model data with texture bindings:
+
+```cpp
+class BlockType {
+public:
+    std::string name;
+    ModelData model;
+    std::map<std::string, std::string> block_face_textures;
+
+    // Rendering flags
+    bool transparent;   // Allows rendering faces behind it
+    bool is_cube;       // Standard 6-face cube vs custom model
+    bool glass;         // Special culling (don't cull same-type faces)
+    bool translucent;   // Requires translucent render pass
+
+    // Geometry data
+    std::vector<Collider> colliders;
+    std::vector<std::vector<float>> vertex_positions;  // Per-face vertex data
+    std::vector<std::vector<float>> tex_coords;        // Per-face UV coords
+    std::vector<int> tex_indices;                      // Texture atlas indices
+    std::vector<std::vector<float>> shading_values;    // Per-vertex shading
+
+    BlockType(TextureManager* tm, std::string name, 
+             std::map<std::string, std::string> face_tex, 
+             ModelData md);
+};
+```
+
+### ModelData Structure
+
+Models are defined as reusable templates (`src/models/model_data.h:6-17`):
+
+```cpp
+struct ModelData {
+    bool transparent = false;
+    bool is_cube = true;
+    bool glass = false;
+    bool translucent = false;
+
+    std::vector<std::pair<glm::vec3, glm::vec3>> colliders;  // AABB min/max pairs
+    std::vector<std::vector<float>> vertex_positions;         // Face geometry
+    std::vector<std::vector<float>> tex_coords;               // UV coordinates
+    std::vector<std::vector<float>> shading_values;           // Per-vertex brightness
+    size_t tex_coords_len = 6;                                // Expected face count
+};
+```
+
+## Standard Models
+
+### Cube Model
+
+The foundational model (`src/models/models.cpp:16-32`):
+
+```cpp
+namespace Models::Cube {
+    ModelData get_model() {
+        ModelData m;
+        m.colliders.push_back({glm::vec3(-0.5), glm::vec3(0.5)});
+        m.vertex_positions = {
+            // East (+X)
+            { 0.5, 0.5, 0.5, 0.5,-0.5, 0.5, 0.5,-0.5,-0.5, 0.5, 0.5,-0.5},
+            // West (-X)
+            {-0.5, 0.5,-0.5,-0.5,-0.5,-0.5,-0.5,-0.5, 0.5,-0.5, 0.5, 0.5},
+            // Top (+Y)
+            { 0.5, 0.5, 0.5, 0.5, 0.5,-0.5,-0.5, 0.5,-0.5,-0.5, 0.5, 0.5},
+            // Bottom (-Y)
+            {-0.5,-0.5, 0.5,-0.5,-0.5,-0.5, 0.5,-0.5,-0.5, 0.5,-0.5, 0.5},
+            // South (+Z)
+            {-0.5, 0.5, 0.5,-0.5,-0.5, 0.5, 0.5,-0.5, 0.5, 0.5, 0.5, 0.5},
+            // North (-Z)
+            { 0.5, 0.5,-0.5, 0.5,-0.5,-0.5,-0.5,-0.5,-0.5,-0.5, 0.5,-0.5}
+        };
+        for(int i=0; i<6; ++i) m.tex_coords.push_back(UV_FULL);
+        m.shading_values = default_shading(6);
+        return m;
+    }
+}
+```
+
+**Face order**: East, West, Top, Bottom, South, North (matches `Util::DIRECTIONS`)
+
+**Vertex format**: Each face has 12 floats (4 vertices × 3 components)
+
+**UV coordinates**: `UV_FULL = {0.0, 1.0,  0.0, 0.0,  1.0, 0.0,  1.0, 1.0}` (8 floats)
+
+### Non-Cube Models
+
+<AccordionGroup>
+  <Accordion title="Plant Model (Cross Shape)">
+    ```cpp
+    namespace Models::Plant {
+        ModelData get_model() {
+            ModelData m;
+            m.transparent = true; 
+            m.is_cube = false;
+            m.vertex_positions = {
+                // Two intersecting quads at 45° angles
+                {-0.3536, 0.5, 0.3536, -0.3536, -0.5, 0.3536, 
+                  0.3536, -0.5, -0.3536, 0.3536, 0.5, -0.3536},
+                {-0.3536, 0.5, -0.3536, -0.3536, -0.5, -0.3536, 
+                  0.3536, -0.5, 0.3536, 0.3536, 0.5, 0.3536},
+                { 0.3536, 0.5, -0.3536, 0.3536, -0.5, -0.3536, 
+                 -0.3536, -0.5, 0.3536, -0.3536, 0.5, 0.3536},
+                { 0.3536, 0.5, 0.3536, 0.3536, -0.5, 0.3536, 
+                 -0.3536, -0.5, -0.3536, -0.3536, 0.5, -0.3536}
+            };
+            for(int i=0; i<4; ++i) m.tex_coords.push_back(UV_FULL);
+            m.shading_values = default_shading(4);
+            m.tex_coords_len = 4;
+            return m;
+        }
+    }
+    ```
+    Used for: Flowers, saplings, mushrooms, sugar cane
+  </Accordion>
+
+  <Accordion title="Liquid Model (Lowered Top)">
+    ```cpp
+    namespace Models::Liquid {
+        ModelData get_model() {
+            ModelData m;
+            m.transparent = true; 
+            m.glass = true; 
+            m.translucent = true;
+            m.vertex_positions = {
+                // Top face at Y=0.375 instead of 0.5
+                { 0.5, 0.375, 0.5, 0.5,-0.625, 0.5, /*...*/},
+                // ... other faces similar to cube
+            };
+            // ...
+        }
+    }
+    ```
+    Used for: Water, lava (with animated textures)
+  </Accordion>
+
+  <Accordion title="Slab Model (Half-Height)">
+    ```cpp
+    namespace Models::Slab {
+        ModelData get_model() {
+            ModelData m;
+            m.transparent = true; 
+            m.is_cube = false;
+            m.colliders.push_back({glm::vec3(-0.5,-0.5,-0.5), 
+                                   glm::vec3(0.5,0.0,0.5)});
+            // Top face at Y=0.0, bottom at Y=-0.5
+            // Sides use UV_HALF for correct texture scaling
+            std::vector<float> UV_HALF = {0.0, 0.5,  0.0, 0.0,  1.0, 0.0,  1.0, 0.5};
+            // ...
+        }
+    }
+    ```
+    Used for: Stone slabs, wooden stairs (simplified)
+  </Accordion>
+
+  <Accordion title="Torch Model (Thin Cross)">
+    ```cpp
+    namespace Models::Torch {
+        ModelData get_model() {
+            ModelData m; 
+            m.transparent = true; 
+            m.is_cube = false;
+            m.vertex_positions = {
+                // 6 thin faces forming a cross + top
+                { 0.0625, 0.5, 0.5, 0.0625,-0.5, 0.5, /*...*/},  // East face
+                {-0.0625, 0.5,-0.5,-0.0625,-0.5,-0.5, /*...*/},  // West face
+                { 0.5, 0.125, 0.5, 0.5, 0.125,-0.5, /*...*/},    // Top face
+                // ...
+            };
+            // ...
+        }
+    }
+    ```
+    No collision boxes - player walks through torches
+  </Accordion>
+</AccordionGroup>
+
+See `src/models/models.cpp` for all 14+ model definitions including Door, Ladder, Cactus, Crops, etc.
+
+## Shading Values
+
+Default per-face shading simulates directional lighting (`src/models/models.cpp:4-12`):
+
+```cpp
+std::vector<std::vector<float>> default_shading(size_t faces) {
+    if(faces == 6) {
+        return {
+            {0.6, 0.6, 0.6, 0.6},  // East  - 60%
+            {0.6, 0.6, 0.6, 0.6},  // West  - 60%
+            {1.0, 1.0, 1.0, 1.0},  // Top   - 100% (brightest)
+            {0.4, 0.4, 0.4, 0.4},  // Bottom - 40% (darkest)
+            {0.8, 0.8, 0.8, 0.8},  // South - 80%
+            {0.8, 0.8, 0.8, 0.8}   // North - 80%
+        };
+    }
+    // Non-cube models default to full brightness
+    return std::vector(faces, {1.0, 1.0, 1.0, 1.0});
+}
+```
+
+These values are multiplied with ambient occlusion and lighting in the final fragment shader.
+
+## Texture Mapping System
+
+The `BlockType` constructor (`src/renderer/block_type.cpp:5-54`) applies textures with a priority hierarchy:
+
+```cpp
+BlockType::BlockType(TextureManager* tm, std::string name, 
+                    std::map<std::string, std::string> face_tex, 
+                    ModelData md) {
+    // ... copy flags and geometry ...
+
+    // 1. Apply "all" texture (lowest priority)
+    apply_texture("all", [&](int idx) {
+        for(size_t i=0; i<tex_indices.size(); ++i) tex_indices[i] = idx;
+    });
+
+    // 2. Apply group textures
+    apply_texture("sides", [&](int idx) {
+        tex_indices[0] = idx; // East
+        tex_indices[1] = idx; // West
+        tex_indices[4] = idx; // South
+        tex_indices[5] = idx; // North
+    });
+    apply_texture("x", [&](int idx) { tex_indices[0] = idx; tex_indices[1] = idx; });
+    apply_texture("y", [&](int idx) { tex_indices[2] = idx; tex_indices[3] = idx; });
+    apply_texture("z", [&](int idx) { tex_indices[4] = idx; tex_indices[5] = idx; });
+
+    // 3. Apply specific face textures (highest priority)
+    apply_texture("right",  [&](int idx) { tex_indices[0] = idx; });
+    apply_texture("left",   [&](int idx) { tex_indices[1] = idx; });
+    apply_texture("top",    [&](int idx) { tex_indices[2] = idx; });
+    apply_texture("bottom", [&](int idx) { tex_indices[3] = idx; });
+    apply_texture("front",  [&](int idx) { tex_indices[4] = idx; });
+    apply_texture("back",   [&](int idx) { tex_indices[5] = idx; });
+}
+```
+
+### Texture Keywords
+
+| Keyword | Faces Applied | Use Case |
+|---------|---------------|----------|
+| `all` | 0-5 (all faces) | Uniform blocks (stone, dirt) |
+| `sides` | 0,1,4,5 (horizontal) | Logs, grass blocks |
+| `x` | 0,1 (East/West) | Fine-grained control |
+| `y` | 2,3 (Top/Bottom) | Fine-grained control |
+| `z` | 4,5 (South/North) | Fine-grained control |
+| `top` | 2 | Grass, crafting table |
+| `bottom` | 3 | Rarely used alone |
+| `front` | 4 | Furnaces, chests |
+| `back` | 5 | Rarely used |
+| `right` | 0 | Custom face textures |
+| `left` | 1 | Custom face textures |
+
+## Block Definition Format
+
+The `data/blocks.mccpp` file defines all block types in a simple text format:
+
+```text
+# Comments start with #
+ID: property value, property value, ...
+```
+
+### Examples from blocks.mccpp
+
+```text
+# Simple uniform block
+1:  name "Stone", texture.all stone
+
+# Multi-texture block
+2:  name "Grass", texture.top grass, texture.bottom dirt, texture.sides grass_side
+
+# Custom model
+6:  name "Sapling", model models.plant, texture.all sapling
+
+# Transparent liquid
+8:  name "Water", model models.liquid, texture.all water
+
+# Reuse previous definition
+9:  sameas 8, name "Stationary Water"
+
+# Complex multi-texture block
+58: name "Crafting Table", 
+    texture.top crafting_table_top, 
+    texture.bottom planks, 
+    texture.x crafting_table_x, 
+    texture.z crafting_table_z
+```
+
+### Property Reference
+
+| Property | Format | Example |
+|----------|--------|----------|
+| `name` | `name "String"` | `name "Diamond Ore"` |
+| `texture.<face>` | `texture.all <file>` | `texture.all stone` |
+| `model` | `model models.<name>` | `model models.plant` |
+| `sameas` | `sameas <ID>` | `sameas 8, name "New Name"` |
+
+<Info>
+  Texture filenames reference PNGs in `assets/textures/` without the `.png` extension.
+</Info>
+
+## Block ID Registry
+
+From `data/blocks.mccpp:1-92`, the standard blocks are:
+
+<AccordionGroup>
+  <Accordion title="Basic Blocks (1-7)">
+    - **1**: Stone
+    - **2**: Grass
+    - **3**: Dirt
+    - **4**: Cobblestone
+    - **5**: Planks
+    - **6**: Sapling (plant model)
+    - **7**: Bedrock
+  </Accordion>
+
+  <Accordion title="Liquids (8-11)">
+    - **8**: Water (liquid model)
+    - **9**: Stationary Water
+    - **10**: Lava (liquid model)
+    - **11**: Stationary Lava
+  </Accordion>
+
+  <Accordion title="Natural Materials (12-18)">
+    - **12**: Sand
+    - **13**: Gravel
+    - **14-16**: Ores (Gold, Iron, Coal)
+    - **17**: Log (directional texture)
+    - **18**: Leaves (transparent cube)
+  </Accordion>
+
+  <Accordion title="Special Blocks (19-24)">
+    - **19**: Sponge
+    - **20**: Glass (glass model)
+    - **21-40**: Colored Cloth (16 colors)
+  </Accordion>
+
+  <Accordion title="Decorative (37-55)">
+    - **37-38**: Flowers (plant model)
+    - **39-40**: Mushrooms (plant model)
+    - **41-42**: Metal blocks
+    - **43-44**: Slabs (slab model)
+    - **50**: Torch (torch model)
+    - **51**: Fire (fire model)
+  </Accordion>
+
+  <Accordion title="Functional (53-84)">
+    - **53, 67, 72**: Stairs
+    - **54**: Chest (directional)
+    - **59**: Crops (crop model)
+    - **60**: Soil (soil model)
+    - **61-62**: Furnaces (directional)
+    - **64, 71, 76**: Doors (door model)
+    - **65**: Ladder (ladder model)
+    - **78**: Snow (snow model)
+    - **88**: Cactus (cactus model)
+  </Accordion>
+</AccordionGroup>
+
+## Usage Examples
+
+### Creating a Custom Block
+
+1. **Add texture** to `assets/textures/my_block.png`
+2. **Define in blocks.mccpp**:
+   ```text
+   85: name "My Block", texture.all my_block
+   ```
+3. **Reload world** or restart game
+
+### Custom Multi-Texture Block
+
+```text
+86: name "Custom Crate", 
+    model models.cube,
+    texture.top crate_top,
+    texture.bottom crate_bottom,
+    texture.sides crate_side
+```
+
+### Custom Model Block
+
+```text
+87: name "Custom Plant", 
+    model models.plant,
+    texture.all custom_plant
+```
+
+## Performance Notes
+
+<Warning>
+  **Transparent blocks** (`transparent = true`) are more expensive to render because they require sorting and disable depth writes. Use sparingly.
+</Warning>
+
+<Tip>
+  **Glass blocks** with the `glass` flag optimize rendering by culling faces between identical glass blocks, significantly reducing overdraw.
+</Tip>
+
+## Related Topics
+
+<CardGroup cols={2}>
+  <Card title="Chunk Meshing" icon="cube" href="/world/meshing">
+    See how BlockType data is used during mesh generation
+  </Card>
+  <Card title="Texture Manager" icon="image" href="/rendering/textures">
+    Learn about the texture atlas system
+  </Card>
+</CardGroup>

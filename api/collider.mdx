@@ -1,0 +1,283 @@
+---
+title: "Collider"
+description: "Collider struct API reference - AABB collision detection with sweep testing"
+---
+
+# Collider
+
+The `Collider` struct represents an axis-aligned bounding box (AABB) with sweep-based collision detection.
+
+## Struct Definition
+
+```cpp
+class Collider {
+public:
+    float x1, y1, z1;  // Min corner
+    float x2, y2, z2;  // Max corner
+
+    Collider(glm::vec3 pos1 = glm::vec3(0), glm::vec3 pos2 = glm::vec3(0));
+    Collider operator+(const glm::vec3& pos) const;
+    bool operator&(const Collider& other) const;
+    std::pair<float, glm::vec3> collide(const Collider& static_col, const glm::vec3& velocity);
+};
+```
+
+## Constructor
+
+### Collider(glm::vec3 pos1, glm::vec3 pos2)
+
+Creates an AABB from two corner points.
+
+**Parameters:**
+- `pos1` - Minimum corner (x1, y1, z1), defaults to origin
+- `pos2` - Maximum corner (x2, y2, z2), defaults to origin
+
+```cpp
+Collider(glm::vec3 pos1 = glm::vec3(0), glm::vec3 pos2 = glm::vec3(0)) {
+    x1 = pos1.x; y1 = pos1.y; z1 = pos1.z;
+    x2 = pos2.x; y2 = pos2.y; z2 = pos2.z;
+}
+```
+
+**Example:**
+```cpp
+// Create a 1x2x1 block collider at origin
+Collider block(glm::vec3(0, 0, 0), glm::vec3(1, 2, 1));
+
+// Create an entity collider (0.6 wide, 1.8 tall)
+glm::vec3 pos = glm::vec3(10, 64, 10);
+Collider entity(
+    pos - glm::vec3(0.3f, 0, 0.3f),
+    pos + glm::vec3(0.3f, 1.8f, 0.3f)
+);
+```
+
+## Operators
+
+### Collider operator+(const glm::vec3& pos)
+
+Translates the collider by a vector offset.
+
+**Parameters:**
+- `pos` - Offset to add to both corners
+
+**Returns:** New translated Collider
+
+```cpp
+Collider operator+(const glm::vec3& pos) const {
+    return Collider(
+        glm::vec3(x1 + pos.x, y1 + pos.y, z1 + pos.z),
+        glm::vec3(x2 + pos.x, y2 + pos.y, z2 + pos.z)
+    );
+}
+```
+
+**Example:**
+```cpp
+// Block collider template (0..1 unit cube)
+Collider block_template(glm::vec3(0), glm::vec3(1));
+
+// Place at world position (5, 10, 3)
+Collider world_collider = block_template + glm::vec3(5, 10, 3);
+// Result: min=(5,10,3), max=(6,11,4)
+```
+
+### bool operator&(const Collider& other)
+
+Checks if two AABBs overlap (static intersection test).
+
+**Parameters:**
+- `other` - The collider to test against
+
+**Returns:** `true` if the AABBs intersect
+
+**Algorithm:**
+- Computes overlap distance on each axis
+- Returns `true` only if all three axes have positive overlap
+
+```cpp
+bool operator&(const Collider& other) const {
+    float x = std::min(x2, other.x2) - std::max(x1, other.x1);
+    float y = std::min(y2, other.y2) - std::max(y1, other.y1);
+    float z = std::min(z2, other.z2) - std::max(z1, other.z1);
+    return x > 0 && y > 0 && z > 0;
+}
+```
+
+**Example:**
+```cpp
+Collider a(glm::vec3(0, 0, 0), glm::vec3(2, 2, 2));
+Collider b(glm::vec3(1, 1, 1), glm::vec3(3, 3, 3));
+if (a & b) {
+    // AABBs overlap at (1,1,1) to (2,2,2)
+}
+```
+
+## Collision Detection
+
+### collide()
+
+```cpp
+std::pair<float, glm::vec3> collide(const Collider& static_col, const glm::vec3& velocity)
+```
+
+Performs swept AABB collision detection (continuous collision).
+
+**Parameters:**
+- `static_col` - The static collider to test against
+- `velocity` - Movement vector for this frame
+
+**Returns:** `std::pair` of:
+- `float` - Entry time [0..1] where collision occurs (1.0 = no collision)
+- `glm::vec3` - Collision normal vector (unit vector or zero)
+
+**Algorithm:**
+1. Compute entry/exit times for each axis using swept AABB formula
+2. Early reject if all entry times are negative (already overlapping from behind)
+3. Early reject if any entry time > 1.0 (won't reach collision this frame)
+4. Find latest entry time and earliest exit time across all axes
+5. Reject if entry > exit (no overlap period)
+6. Determine collision normal from the axis with latest entry time
+
+```cpp
+std::pair<float, glm::vec3> collide(const Collider& static_col, const glm::vec3& velocity) {
+    float vx = velocity.x, vy = velocity.y, vz = velocity.z;
+    
+    // Time calculation helper
+    auto time_func = [](float x, float y) -> float {
+        if (y == 0) return (x > 0) ? -inf : +inf;
+        return x / y;
+    };
+    
+    // Compute entry/exit times per axis
+    float x_entry = time_func(vx > 0 ? static_col.x1 - x2 : static_col.x2 - x1, vx);
+    float x_exit = time_func(vx > 0 ? static_col.x2 - x1 : static_col.x1 - x2, vx);
+    float y_entry = time_func(vy > 0 ? static_col.y1 - y2 : static_col.y2 - y1, vy);
+    float y_exit = time_func(vy > 0 ? static_col.y2 - y1 : static_col.y1 - y2, vy);
+    float z_entry = time_func(vz > 0 ? static_col.z1 - z2 : static_col.z2 - z1, vz);
+    float z_exit = time_func(vz > 0 ? static_col.z2 - z1 : static_col.z1 - z2, vz);
+    
+    // Early rejections
+    if (x_entry < 0 && y_entry < 0 && z_entry < 0) return {1.0f, glm::vec3(0)};
+    if (x_entry > 1 || y_entry > 1 || z_entry > 1) return {1.0f, glm::vec3(0)};
+    
+    // Find collision window
+    float entry = std::max({x_entry, y_entry, z_entry});
+    float exit_ = std::min({x_exit, y_exit, z_exit});
+    
+    if (entry > exit_) return {1.0f, glm::vec3(0)};
+    
+    // Determine collision normal
+    glm::vec3 normal(0);
+    if (entry == x_entry) normal.x = (vx > 0) ? -1 : 1;
+    else if (entry == y_entry) normal.y = (vy > 0) ? -1 : 1;
+    else normal.z = (vz > 0) ? -1 : 1;
+    
+    return {entry, normal};
+}
+```
+
+## AABB Sweep Theory
+
+Swept AABB collision detects the **first moment** a moving box touches a static box:
+
+### Entry/Exit Times
+
+For each axis, compute when the moving AABB's **trailing edge** enters and **leading edge** exits the static AABB:
+
+```
+If moving right (vx > 0):
+  entry_x = (static.x1 - moving.x2) / vx
+  exit_x = (static.x2 - moving.x1) / vx
+
+If moving left (vx < 0):
+  entry_x = (static.x2 - moving.x1) / vx
+  exit_x = (static.x1 - moving.x2) / vx
+
+If stationary (vx == 0):
+  entry_x = moving.x1 < static.x2 ? -∞ : +∞
+  exit_x = moving.x2 > static.x1 ? +∞ : -∞
+```
+
+### Collision Window
+
+A collision occurs when all three axes overlap:
+
+```
+entry_time = max(entry_x, entry_y, entry_z)
+exit_time = min(exit_x, exit_y, exit_z)
+
+if entry_time <= exit_time and entry_time in [0, 1]:
+    collision at time = entry_time
+    normal = axis with max entry time
+```
+
+### Normal Vector
+
+The collision normal points **away from the static collider** along the axis that had the latest entry:
+
+```cpp
+if (entry == x_entry) normal.x = (vx > 0) ? -1 : 1;  // Hit left/right face
+else if (entry == y_entry) normal.y = (vy > 0) ? -1 : 1;  // Hit bottom/top
+else normal.z = (vz > 0) ? -1 : 1;  // Hit front/back
+```
+
+## Usage Example
+
+```cpp
+// Entity moving right at 5 units/sec for 0.1 sec
+Collider entity(glm::vec3(0, 0, 0), glm::vec3(1, 2, 1));
+Collider wall(glm::vec3(4, 0, 0), glm::vec3(5, 3, 1));
+
+glm::vec3 velocity(5.0f * 0.1f, 0, 0);  // Move 0.5 units right
+auto [entry_time, normal] = entity.collide(wall, velocity);
+
+if (normal != glm::vec3(0)) {
+    // Collision detected!
+    // entry_time = 0.6 (collision at 60% of movement)
+    // normal = (-1, 0, 0) (hit wall's left face)
+    
+    // Move entity to collision point
+    glm::vec3 safe_position = entity_pos + velocity * (entry_time - 0.001f);
+    
+    // Zero velocity along collision normal
+    if (normal.x != 0) velocity_x = 0;
+}
+```
+
+## Integration with Entity Physics
+
+In `Entity::update()`, collision detection runs in 3 passes:
+
+```cpp
+for (int i = 0; i < 3; i++) {
+    glm::vec3 adj_vel = velocity * dt;
+    std::pair<float, glm::vec3> collision = {1.0f, glm::vec3(0)};
+    
+    // Search nearby blocks
+    for (auto& block : nearby_blocks) {
+        for (auto& block_collider : block.colliders) {
+            auto res = entity.collider.collide(block_collider, adj_vel);
+            if (res.second != glm::vec3(0) && res.first < collision.first) {
+                collision = res;  // Track earliest collision
+            }
+        }
+    }
+    
+    // Apply collision
+    float entry = collision.first - 0.001f;  // Small offset to prevent sticking
+    glm::vec3 normal = collision.second;
+    
+    if (normal.x != 0) { position.x += adj_vel.x * entry; velocity.x = 0; }
+    if (normal.y != 0) { position.y += adj_vel.y * entry; velocity.y = 0; }
+    if (normal.z != 0) { position.z += adj_vel.z * entry; velocity.z = 0; }
+    
+    if (normal.y == 1) grounded = true;  // Hit floor
+}
+```
+
+## See Also
+
+- [Entity](/api/entity) - Entity class that uses Collider for physics
+- [BlockType](/api/block-type) - Block definitions with collider arrays
+- [World](/api/world) - World block access for collision queries

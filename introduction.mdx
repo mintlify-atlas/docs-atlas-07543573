@@ -1,0 +1,106 @@
+---
+title: Introduction
+description: Welcome to MC-CPP - A high-performance Minecraft-inspired voxel engine written in C++
+---
+
+MC-CPP is a Minecraft-inspired voxel game engine built from scratch in C++20 with a focus on performance and modern rendering techniques.
+
+## Overview
+
+MC-CPP combines classic voxel gameplay with advanced graphics features including:
+
+- **Real-time shadow mapping** with Cascaded Shadow Maps (CSM)
+- **Colored lighting system** with day/night cycles
+- **Smooth ambient occlusion** for realistic block shading
+- **Optimized chunk rendering** with distance-based LOD
+- **Physics-based player movement** with collision detection
+
+## Key Features
+
+### Modern Rendering Pipeline
+
+- OpenGL 3.3+ with GLFW for windowing
+- Custom shader system for advanced lighting effects
+- Texture atlas with mipmapping for optimal performance
+- Post-processing effects with framebuffer support
+
+### World Generation & Management
+
+- Infinite world streaming with NBT-based chunk persistence
+- Efficient chunk meshing with greedy meshing algorithms
+- Light propagation system (skylight and block light)
+- Automatic chunk loading/unloading based on render distance
+
+### Performance Optimizations
+
+- Incremental chunk updates with configurable limits (`Options::CHUNK_UPDATES`)
+- Asynchronous lighting calculations (`Options::LIGHT_STEPS_PER_TICK`)
+- Frustum culling and distance-based chunk sorting
+- Link-time optimization (LTO) and platform-specific compiler flags
+
+### Advanced Shadow System
+
+- 4-cascade directional shadow maps (configurable via `Options::SHADOW_CASCADES`)
+- PCF (Percentage Closer Filtering) for soft shadows
+- 2048x2048 resolution per cascade (configurable)
+- Dynamic cascade splitting based on camera frustum
+
+## Architecture
+
+The engine is organized into modular components:
+
+- **Rendering**: Shader management, texture atlases, block models
+- **World & Chunks**: Chunk storage, meshing, lighting propagation
+- **Entities**: Player physics, camera matrices, collision detection
+- **Persistence**: NBT-based save/load with gzip compression
+- **Audio**: Background music playback with miniaudio
+
+For a detailed architecture overview, see `AGENTS.md` in the source repository.
+
+## Getting Started
+
+<CardGroup cols={2}>
+  <Card
+    title="Building the Project"
+    icon="hammer"
+    href="/building"
+  >
+    Learn how to compile MC-CPP from source using CMake
+  </Card>
+  <Card
+    title="Quickstart Guide"
+    icon="rocket"
+    href="/quickstart"
+  >
+    Get the game running and explore basic controls
+  </Card>
+</CardGroup>
+
+## System Requirements
+
+### Minimum
+
+- C++20 compatible compiler (GCC 10+, Clang 11+, MSVC 2019+)
+- CMake 3.17 or higher
+- OpenGL 3.3 compatible GPU
+- 4 GB RAM
+
+### Recommended
+
+- Modern CPU with 4+ cores
+- Dedicated GPU with 2+ GB VRAM
+- 8 GB RAM for higher render distances
+
+## Technologies
+
+MC-CPP leverages several key libraries:
+
+- **GLFW** - Cross-platform windowing and input
+- **GLAD** - OpenGL function loader
+- **GLM** - Mathematics library for graphics
+- **stb_image** - Texture loading
+- **stb_truetype** - Font rendering
+- **miniaudio** - Audio playback
+- **zlib** - Data compression for world saves
+
+All dependencies are included in the `include/` directory for easy building.

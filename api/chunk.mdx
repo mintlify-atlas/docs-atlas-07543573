@@ -1,0 +1,279 @@
+---
+title: Chunk
+description: Individual chunk storage and mesh generation for 16x128x16 world sections
+---
+
+The `Chunk` class represents a 16×128×16 section of the world, storing block data, lighting information, and managing mesh generation for rendering.
+
+## Constants
+
+```cpp
+const int CHUNK_WIDTH = 16;
+const int CHUNK_HEIGHT = 128;
+const int CHUNK_LENGTH = 16;
+```
+
+## Constructor
+
+```cpp
+Chunk(World* w, glm::ivec3 pos);
+```
+
+<ParamField path="w" type="World*">
+  Pointer to the parent world instance
+</ParamField>
+
+<ParamField path="pos" type="glm::ivec3">
+  Chunk position in chunk coordinates (not world coordinates)
+</ParamField>
+
+Creates a new chunk with all blocks initialized to air (0) and lighting to 0. Automatically creates subchunks for mesh subdivision and initializes OpenGL buffers.
+
+## Block Data Access
+
+### get_block_light
+
+```cpp
+int get_block_light(glm::ivec3 pos) const;
+```
+
+<ParamField path="pos" type="glm::ivec3">
+  Local chunk position (0-15, 0-127, 0-15)
+</ParamField>
+
+Returns block light level (0-15) at the local position. Light data is packed in the lower 4 bits of the lightmap.
+
+### set_block_light
+
+```cpp
+void set_block_light(glm::ivec3 pos, int value);
+```
+
+<ParamField path="pos" type="glm::ivec3">
+  Local chunk position
+</ParamField>
+
+<ParamField path="value" type="int">
+  Light level (0-15)
+</ParamField>
+
+Sets block light level at the local position, preserving skylight data.
+
+### get_sky_light
+
+```cpp
+int get_sky_light(glm::ivec3 pos) const;
+```
+
+<ParamField path="pos" type="glm::ivec3">
+  Local chunk position
+</ParamField>
+
+Returns skylight level (0-15) at the local position. Skylight data is stored in the upper 4 bits of the lightmap.
+
+### set_sky_light
+
+```cpp
+void set_sky_light(glm::ivec3 pos, int value);
+```
+
+<ParamField path="pos" type="glm::ivec3">
+  Local chunk position
+</ParamField>
+
+<ParamField path="value" type="int">
+  Skylight level (0-15)
+</ParamField>
+
+Sets skylight level at the local position, preserving block light data.
+
+### get_raw_light
+
+```cpp
+uint8_t get_raw_light(glm::ivec3 pos) const;
+```
+
+Returns the raw packed lightmap byte containing both block light (lower 4 bits) and skylight (upper 4 bits).
+
+## Cached Neighbor Access
+
+### get_block_number_cached
+
+```cpp
+int get_block_number_cached(glm::ivec3 global_pos) const;
+```
+
+<ParamField path="global_pos" type="glm::ivec3">
+  World-space position
+</ParamField>
+
+Fast block lookup that uses cached neighbor pointers when accessing adjacent chunks, avoiding hash map lookups.
+
+### get_light_cached
+
+```cpp
+int get_light_cached(glm::ivec3 global_pos) const;
+```
+
+Fast block light lookup using neighbor cache.
+
+### get_skylight_cached
+
+```cpp
+int get_skylight_cached(glm::ivec3 global_pos) const;
+```
+
+Fast skylight lookup using neighbor cache.
+
+### is_opaque_cached
+
+```cpp
+bool is_opaque_cached(glm::ivec3 global_pos) const;
+```
+
+Returns `true` if the block at the global position is opaque (not transparent). Uses neighbor cache for performance.
+
+## Mesh Updates
+
+### update_at_position
+
+```cpp
+void update_at_position(glm::ivec3 pos);
+```
+
+<ParamField path="pos" type="glm::ivec3">
+  Local chunk position where a block changed
+</ParamField>
+
+Queues the subchunk containing the position for remeshing. Also queues neighboring subchunks if the position is on a subchunk boundary.
+
+### update_subchunk_meshes
+
+```cpp
+void update_subchunk_meshes();
+```
+
+Queues all subchunks in the chunk for remeshing. Used when lighting changes affect the entire chunk.
+
+### process_chunk_updates
+
+```cpp
+void process_chunk_updates();
+```
+
+Processes a limited number of queued subchunk mesh updates per frame (controlled by `Options::CHUNK_UPDATES`). Called during `World::tick()`.
+
+### update_mesh
+
+```cpp
+void update_mesh();
+```
+
+Merges all subchunk meshes into the chunk's main mesh and uploads to GPU. Separates opaque and translucent geometry.
+
+### send_mesh_data_to_gpu
+
+```cpp
+void send_mesh_data_to_gpu();
+```
+
+Uploads vertex data to the GPU via `glBufferSubData`. Automatically resizes VBO if needed.
+
+## Rendering
+
+### draw
+
+```cpp
+void draw(GLenum mode, Shader* override_shader = nullptr, int chunk_uniform = -1);
+```
+
+<ParamField path="mode" type="GLenum">
+  OpenGL primitive mode (typically `GL_TRIANGLES`)
+</ParamField>
+
+<ParamField path="override_shader" type="Shader*" default="nullptr">
+  Optional shader to use instead of world shader (used for shadow pass)
+</ParamField>
+
+<ParamField path="chunk_uniform" type="int" default="-1">
+  Optional cached uniform location for `u_ChunkPosition`
+</ParamField>
+
+Draws opaque geometry using `glDrawElements`.
+
+### draw_translucent
+
+```cpp
+void draw_translucent(GLenum mode, Shader* override_shader = nullptr, int chunk_uniform = -1);
+```
+
+Draws translucent geometry (water, glass) using `glDrawElementsBaseVertex` with offset based on opaque quad count.
+
+## Public Members
+
+```cpp
+World* world;                          // Parent world reference
+glm::ivec3 chunk_position;              // Chunk coordinates
+glm::vec3 position;                     // World-space base position
+bool modified;                          // Chunk has unsaved changes
+Chunk* neighbors[6];                    // Cached neighbor pointers (E,W,U,D,S,N)
+
+uint8_t blocks[CHUNK_WIDTH][CHUNK_HEIGHT][CHUNK_LENGTH];   // Block IDs
+uint8_t lightmap[CHUNK_WIDTH][CHUNK_HEIGHT][CHUNK_LENGTH]; // Packed lighting
+
+std::map<std::tuple<int,int,int>, Subchunk*> subchunks; // Subchunk grid
+std::deque<Subchunk*> chunk_update_queue;                // Pending mesh updates
+
+std::vector<uint32_t> mesh;             // Merged opaque mesh
+std::vector<uint32_t> translucent_mesh; // Merged translucent mesh
+int mesh_quad_count;                    // Number of opaque quads
+int translucent_quad_count;             // Number of translucent quads
+
+GLuint vao, vbo;                        // OpenGL vertex array and buffer
+size_t vbo_capacity;                    // Current VBO size in uint32_t
+```
+
+## Lightmap Packing
+
+The `lightmap` array stores both block light and skylight in a single `uint8_t` per block:
+
+```cpp
+// Lower 4 bits: block light (0-15)
+// Upper 4 bits: skylight (0-15)
+uint8_t packed = (skylight << 4) | blocklight;
+```
+
+## Example Usage
+
+```cpp
+// Create chunk
+Chunk* chunk = new Chunk(&world, glm::ivec3(0, 0, 0));
+
+// Set a block
+chunk->blocks[5][64][5] = 1; // Stone
+chunk->modified = true;
+
+// Update lighting
+chunk->set_block_light(glm::ivec3(5, 64, 5), 15);
+chunk->set_sky_light(glm::ivec3(5, 65, 5), 15);
+
+// Queue mesh update
+chunk->update_at_position(glm::ivec3(5, 64, 5));
+
+// Process updates and render
+chunk->process_chunk_updates();
+chunk->update_mesh();
+chunk->draw(GL_TRIANGLES);
+```
+
+## Performance Notes
+
+- Mesh updates are amortized across frames using `chunk_update_queue`
+- Neighbor caching (`neighbors[]`) avoids hash map lookups during meshing
+- Subchunks enable partial remeshing (only affected 8×8×8 sections rebuild)
+- VBO is dynamically resized only when necessary
+
+## See Also
+
+- [World](/api/world) - Parent world management
+- [BlockType](/api/block-type) - Block type definitions
