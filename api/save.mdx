@@ -1,0 +1,271 @@
+---
+title: Save
+description: API reference for the Save class - world persistence and chunk streaming
+---
+
+## Overview
+
+The `Save` class handles world persistence (loading/saving chunks to disk) and manages chunk streaming during gameplay.
+
+```cpp
+class Save {
+public:
+    World* world;
+    std::string path;
+    
+    Save(World* w);
+    void save();
+    void load(int initial_radius = 2);
+    void update_streaming(glm::vec3 player_pos);
+    void stream_next(int max_chunks = 1);
+    bool has_pending_chunks() const;
+};
+```
+
+**Source:** `src/save.h`, `src/save.cpp`
+
+## Constructor
+
+### Save(World\* w)
+
+Creates a save system for a world.
+
+**Parameters:**
+- `w` - World instance to manage
+
+**Initialization:**
+- Sets `path` to `"save/"` directory
+- Creates save directory if it doesn't exist
+- Associates with the given world
+
+**Example:**
+```cpp
+Save* save_system = new Save(world);
+```
+
+## Methods
+
+### save()
+
+```cpp
+void save()
+```
+
+Saves all loaded chunks to disk.
+
+**Process:**
+1. Iterates through all chunks in `world->chunks`
+2. Calls `save_chunk()` for each chunk
+3. Writes NBT-compressed chunk data to `save/<rx>/<rz>/c.<x>.<z>.dat`
+
+**Performance:** Blocking operation - can cause frame drops if many chunks are loaded.
+
+### load()
+
+```cpp
+void load(int initial_radius = 2)
+```
+
+Performs initial world load with a two-phase strategy.
+
+**Parameters:**
+- `initial_radius` - Number of chunks to load immediately (default: 2)
+
+**Strategy:**
+1. **Eager phase**: Loads chunks within `initial_radius` with `eager_build=true`
+   - Performs full lighting propagation immediately
+   - Generates all meshes synchronously
+   - Ensures starting area is fully lit and rendered
+   
+2. **Streaming phase**: Queues remaining chunks (up to render distance) with `eager_build=false`
+   - Defers lighting and meshing to future frames
+   - Prevents FPS drops during initial spawn
+
+**Example:**
+```cpp
+save_system->load(2); // Load 2-chunk radius immediately
+```
+
+<Note>
+The `eager_build` flag is critical for FPS stability. See [Performance Optimization](/performance/optimization) for details on the chunk loading improvements.
+</Note>
+
+### update_streaming()
+
+```cpp
+void update_streaming(glm::vec3 player_pos)
+```
+
+Updates which chunks should be loaded based on player position.
+
+**Parameters:**
+- `player_pos` - Current player world position
+
+**Behavior:**
+1. Converts player position to chunk coordinates
+2. If player moved to a new chunk:
+   - Queues new chunks within render distance
+   - Unloads chunks beyond render distance + 2
+   - Saves unloaded chunks to disk
+
+**Call frequency:** Every frame in `main.cpp`
+
+### stream_next()
+
+```cpp
+void stream_next(int max_chunks = 1)
+```
+
+Processes pending chunk load operations.
+
+**Parameters:**
+- `max_chunks` - Maximum chunks to load this frame (default: 1)
+
+**Process:**
+1. Pops up to `max_chunks` from the pending queue
+2. Calls `load_chunk(pos, false)` for each
+3. Defers lighting/meshing to `World::tick()`
+
+**Call frequency:** Every frame in `main.cpp` if `has_pending_chunks()`
+
+<Tip>
+Loading 1 chunk per frame keeps frame time stable. Increase `max_chunks` for faster world generation at the cost of FPS stability.
+</Tip>
+
+### has_pending_chunks()
+
+```cpp
+bool has_pending_chunks() const
+```
+
+Checks if there are chunks waiting to be loaded.
+
+**Returns:** `true` if `pending_chunks` queue is not empty
+
+**Usage:**
+```cpp
+if (save_system->has_pending_chunks()) {
+    save_system->stream_next(1);
+}
+```
+
+## Private Methods
+
+### load_chunk()
+
+```cpp
+bool load_chunk(const glm::ivec3& pos, bool eager_build)
+```
+
+Loads a single chunk from disk or generates it if not found.
+
+**Parameters:**
+- `pos` - Chunk position
+- `eager_build` - If `true`, perform full lighting/meshing immediately; if `false`, defer to `World::tick()`
+
+**Process:**
+1. Check if chunk already exists
+2. Create new chunk
+3. Attempt to read from disk via NBT
+4. If file not found, generate flat terrain
+5. If `eager_build=true`:
+   - Run full lighting propagation (no step limit)
+   - Build all subchunk meshes immediately
+6. If `eager_build=false`:
+   - Queue lighting propagation (processed via `LIGHT_STEPS_PER_TICK`)
+   - Queue mesh updates (processed via `CHUNK_UPDATES`)
+
+**Returns:** `true` if chunk was loaded/generated successfully
+
+### save_chunk()
+
+```cpp
+bool save_chunk(Chunk* chunk)
+```
+
+Saves a chunk to disk using NBT format with gzip compression.
+
+**Parameters:**
+- `chunk` - Chunk to save
+
+**File path:** `save/<rx>/<rz>/c.<x>.<z>.dat`
+- Uses base36 encoding for region directories
+
+**Returns:** `true` if save succeeded
+
+**See:** [NBT Format](/persistence/nbt-format) for file structure details
+
+## Data Members
+
+### path
+
+```cpp
+std::string path
+```
+
+Base directory for save files (typically `"save/"`)
+
+### pending_chunks
+
+```cpp
+std::deque<glm::ivec3> pending_chunks
+```
+
+Queue of chunk positions waiting to be loaded.
+
+**Usage:**
+- Populated by `update_streaming()`
+- Consumed by `stream_next()`
+
+### last_center_chunk
+
+```cpp
+glm::ivec3 last_center_chunk
+```
+
+Tracks the last chunk position the player was in to detect movement.
+
+## Integration Example
+
+Typical usage in `main.cpp`:
+
+```cpp
+// Initialization
+Save* save_system = new Save(world);
+world->save_system = save_system;
+save_system->load(2);
+
+// Game loop
+while (!glfwWindowShouldClose(window)) {
+    // Update streaming based on player movement
+    save_system->update_streaming(player->position);
+    
+    // Load pending chunks (1 per frame for stable FPS)
+    if (save_system->has_pending_chunks()) {
+        save_system->stream_next(1);
+    }
+    
+    // ... rest of game loop
+}
+
+// Shutdown
+save_system->save(); // Save all chunks before exit
+```
+
+## Performance Considerations
+
+- **Synchronous I/O**: Chunk loading/saving blocks the main thread
+- **eager_build flag**: Critical for FPS stability
+  - `true`: Use only for initial spawn area (small radius)
+  - `false`: Use for streaming during gameplay
+- **Unload distance**: Chunks beyond `render_distance + 2` are unloaded and saved
+
+<Warning>
+Setting `eager_build=true` for streaming chunks will cause severe FPS drops. This should only be used for the initial load radius.
+</Warning>
+
+## See Also
+
+- [Save System](/persistence/save-system) - Detailed persistence architecture
+- [NBT Format](/persistence/nbt-format) - File format documentation
+- [Performance Optimization](/performance/optimization) - Chunk loading improvements

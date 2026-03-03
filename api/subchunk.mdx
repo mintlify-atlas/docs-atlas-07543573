@@ -1,0 +1,228 @@
+---
+title: Subchunk
+description: API reference for the Subchunk class - 16×16×16 mesh generation units
+---
+
+## Overview
+
+The `Subchunk` class represents a 16×16×16 subdivision of a chunk, responsible for generating optimized triangle meshes with smooth lighting and ambient occlusion.
+
+```cpp
+class Subchunk {
+public:
+    Chunk* parent;
+    World* world;
+    glm::ivec3 subchunk_position;
+    glm::ivec3 local_position;
+    glm::vec3 position;
+    
+    std::vector<uint32_t> mesh;
+    std::vector<uint32_t> translucent_mesh;
+    
+    Subchunk(Chunk* p, glm::ivec3 pos);
+    void update_mesh();
+};
+```
+
+**Source:** `src/chunk/subchunk.h`, `src/chunk/subchunk.cpp`
+
+## Constructor
+
+### Subchunk(Chunk\* p, glm::ivec3 pos)
+
+Creates a new subchunk within a parent chunk.
+
+**Parameters:**
+- `p` - Parent chunk pointer
+- `pos` - Subchunk position (0-7 in each axis within the chunk)
+
+**Example:**
+```cpp
+Subchunk* sub = new Subchunk(chunk, glm::ivec3(0, 2, 0));
+```
+
+## Methods
+
+### update_mesh()
+
+```cpp
+void update_mesh()
+```
+
+Rebuilds the mesh for this subchunk by iterating through all blocks and generating visible faces with smooth lighting and AO.
+
+**Process:**
+1. Clear existing mesh data
+2. Iterate through all 4096 blocks (16×16×16)
+3. Check each of 6 faces for visibility
+4. Generate vertices with packed lighting data
+5. Separate opaque and translucent geometry
+
+**Performance:** This is a CPU-intensive operation. The engine limits how many subchunks can rebuild per frame via `Options::CHUNK_UPDATES`.
+
+## Private Helper Methods
+
+These methods are used internally during mesh generation:
+
+### smooth()
+
+```cpp
+float smooth(float a, float b, float c, float d)
+```
+
+Interpolates lighting values across a quad face using 4 corner samples.
+
+**Returns:** Smoothed light value
+
+### ao_val()
+
+```cpp
+float ao_val(bool s1, bool s2, bool c)
+```
+
+Calculates ambient occlusion factor for a vertex corner.
+
+**Parameters:**
+- `s1`, `s2` - Two side neighbors
+- `c` - Corner neighbor
+
+**Returns:** AO factor (0-3 neighbors blocking → darker)
+
+### get_face_ao()
+
+```cpp
+std::array<float, 4> get_face_ao(bool s1, bool s2, bool s3, bool s4, 
+                                  bool s5, bool s6, bool s7, bool s8)
+```
+
+Computes AO values for all 4 vertices of a face.
+
+**Returns:** Array of 4 AO factors (one per vertex)
+
+### get_smooth_face_light()
+
+```cpp
+std::array<float, 4> get_smooth_face_light(float light, float l1, float l2, 
+                                            float l3, float l4, float l5, 
+                                            float l6, float l7, float l8)
+```
+
+Calculates smooth lighting for all 4 vertices using 9-sample interpolation (center + 8 neighbors).
+
+**Returns:** Array of 4 interpolated light values
+
+### get_neighbour_voxels()
+
+```cpp
+std::array<glm::ivec3, 8> get_neighbour_voxels(glm::ivec3 npos, int face)
+```
+
+Returns the 8 neighbor positions surrounding a face for AO/lighting calculations.
+
+**Parameters:**
+- `npos` - Position of the neighbor block
+- `face` - Face index (0-5)
+
+**Returns:** 8 neighbor block positions
+
+### get_light() / get_skylight()
+
+```cpp
+std::array<float, 4> get_light(int block, int face, glm::ivec3 pos, glm::ivec3 npos)
+std::array<float, 4> get_skylight(int block, int face, glm::ivec3 pos, glm::ivec3 npos)
+```
+
+Retrieve block light or skylight values for a face's 4 vertices with smooth interpolation.
+
+**Returns:** Array of 4 light/skylight values (0-15 range)
+
+### get_shading()
+
+```cpp
+std::array<float, 4> get_shading(int block, BlockType& bt, int face, glm::ivec3 npos)
+```
+
+Gets directional shading values from the block type model data.
+
+**Returns:** Array of 4 shading multipliers
+
+### add_face()
+
+```cpp
+void add_face(int face, glm::ivec3 pos, glm::ivec3 lpos, int block, 
+              BlockType& bt, glm::ivec3 npos)
+```
+
+Adds a visible face to the appropriate mesh (opaque or translucent) with all lighting data packed.
+
+**Parameters:**
+- `face` - Face index (0-5)
+- `pos` - Block world position
+- `lpos` - Local position within subchunk
+- `block` - Block type ID
+- `bt` - BlockType reference
+- `npos` - Neighbor block position
+
+### can_render_face()
+
+```cpp
+bool can_render_face(BlockType& bt, int block_number, glm::ivec3 position)
+```
+
+Determines if a face should be rendered based on neighbor transparency.
+
+**Logic:**
+- Always render if neighbor is air or transparent
+- For glass blocks, render only if neighbor is NOT glass
+- Skip face if neighbor is the same opaque block
+
+**Returns:** `true` if face should be rendered
+
+## Data Members
+
+### mesh / translucent_mesh
+
+```cpp
+std::vector<uint32_t> mesh;
+std::vector<uint32_t> translucent_mesh;
+```
+
+Packed vertex data (3 uint32_t per vertex). See [Meshing](/world/meshing) for the packing format.
+
+### Position Fields
+
+- `subchunk_position` - Position within parent chunk (0-7 per axis)
+- `local_position` - Position within chunk (in blocks)
+- `position` - Absolute world position (in blocks)
+
+## Integration
+
+Subchunks are managed by their parent `Chunk`:
+
+```cpp
+// Chunk schedules subchunk mesh updates
+chunk->update_subchunk_meshes();
+
+// Chunk processes the queue
+chunk->process_chunk_updates(); // Rebuilds up to CHUNK_UPDATES subchunks
+
+// Chunk merges subchunk meshes
+chunk->update_mesh(); // Combines all subchunk meshes into one VBO
+```
+
+## Performance Considerations
+
+- **Mesh generation is expensive**: Each subchunk can have up to 6 × 16³ = 24,576 potential faces
+- **Face culling**: Most faces are culled (only exposed faces render)
+- **Smooth lighting**: 9-sample interpolation per vertex adds overhead
+- **Update batching**: `Options::CHUNK_UPDATES` limits rebuilds per frame
+
+<Note>
+Subchunk mesh updates are deferred and batched. After modifying blocks, call `chunk->update_at_position()` to queue affected subchunks rather than rebuilding immediately.
+</Note>
+
+## See Also
+
+- [Chunk](/api/chunk) - Parent chunk class
+- [Meshing](/world/meshing) - Detailed meshing algorithm
+- [Lighting](/rendering/lighting) - Smooth lighting system

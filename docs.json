@@ -89,8 +89,10 @@
             "pages": [
               "api/world",
               "api/chunk",
+              "api/subchunk",
               "api/player",
-              "api/block-type"
+              "api/block-type",
+              "api/save"
             ]
           },
           {
